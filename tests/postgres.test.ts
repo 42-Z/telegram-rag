@@ -29,6 +29,8 @@ describe("строка подключения", () => {
     });
     expect(config.ssl).toBeTruthy();
     expect(config.ssl.rejectUnauthorized).not.toBe(false);
+    // require закреплён как полная проверка сертификата
+    expect(config.ssl).toEqual({});
   });
 
   it("Supabase: свой корневой сертификат подставляется поверх строки", async () => {

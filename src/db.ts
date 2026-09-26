@@ -36,8 +36,17 @@ export async function openDb(url: string, options: PostgresOptions = {}): Promis
  */
 export async function postgresConfig(url: string, options: PostgresOptions = {}) {
   const { parse } = await import("pg-connection-string");
-  const parsed = parse(url) as Record<string, any>;
   const params = new URL(url).searchParams;
+  // Сейчас pg понимает require как полную проверку сертификата (verify-full), а
+  // со следующей версии — как libpq, без проверки. Закрепляем проверку явно:
+  // сертификаты Neon публичные, для Supabase подставляется DATABASE_CA_CERT.
+  const mode = params.get("sslmode");
+  if (mode && ["prefer", "require", "verify-ca"].includes(mode) && !params.has("uselibpqcompat")) {
+    const strict = new URL(url);
+    strict.searchParams.set("sslmode", "verify-full");
+    url = strict.toString();
+  }
+  const parsed = parse(url) as Record<string, any>;
 
   let ssl = parsed.ssl;
   if (options.caCert) {
@@ -94,11 +103,6 @@ async function openPostgres(url: string, options: PostgresOptions): Promise<Db> 
   // int8 — идентификаторы каналов Telegram. Они меньше 2^53, число без потерь.
   pg.types.setTypeParser(20, (value: string) => Number(value));
   const pool = new pg.Pool(await postgresConfig(url, options));
-  pool.on("connect", (client) => {
-    // pgvector ≥ 0.8: при фильтрах по каналу и дате индекс добирает кандидатов,
-    // а не отдаёт меньше запрошенного.
-    client.query("SET hnsw.iterative_scan = relaxed_order").catch(() => {});
-  });
   // Облачная база может усыпить вычисления или перезапуститься: соединение
   // из пула выбрасывается, следующий запрос откроет новое.
   pool.on("error", (error) => log.warn("соединение с базой оборвалось, будет открыто новое", error));
@@ -244,6 +248,15 @@ ${
  */
 export async function migrate(db: Db, embedding: { model: string; dimensions: number }): Promise<void> {
   await db.exec(SCHEMA);
+  // pgvector ≥ 0.8: при фильтрах по каналу и дате индекс добирает кандидатов,
+  // а не отдаёт меньше запрошенного. Настройка закрепляется за пользователем
+  // базы и действует в каждом новом соединении — в том числе через пулер,
+  // где SET в начале соединения теряется.
+  try {
+    await db.exec("ALTER ROLE CURRENT_USER SET hnsw.iterative_scan = relaxed_order");
+  } catch (error) {
+    log.warn("hnsw.iterative_scan не закреплён — фильтрованный поиск может вернуть меньше результатов", error);
+  }
   const signature = `${embedding.model}:${embedding.dimensions}`;
   const [current] = await db.query<{ value: string }>("SELECT value FROM meta WHERE key = 'embedding'");
   if (current && current.value !== signature) {
