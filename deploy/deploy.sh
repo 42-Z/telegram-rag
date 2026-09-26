@@ -6,11 +6,15 @@
 # - Скачивает образ, пересоздаёт контейнеры, ждёт проверки здоровья (180 с).
 # - При неудаче выводит журнал и сам откатывается на прежний тег.
 # - Каждый тег дописывается в releases.log — по нему откатываются руками.
-# - База (том telegram-rag-db) при выкатке не пересоздаётся.
+# - База — облачная (DATABASE_URL в /etc/telegram-rag.env), выкатка её не трогает.
 set -euo pipefail
 
 TAG="${1:?usage: deploy.sh <image-tag>}"
 COMPOSE="docker compose -f docker-compose.yml"
+# Местные добавки сервера (сертификат базы и т. п.) — в override, его выкатка не трогает.
+if [ -f docker-compose.override.yml ]; then
+  COMPOSE="$COMPOSE -f docker-compose.override.yml"
+fi
 HEALTH_TIMEOUT=180
 
 log() {

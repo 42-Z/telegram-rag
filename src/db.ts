@@ -1,10 +1,12 @@
 /**
- * База: Postgres с расширением pgvector. В бою — настоящий Postgres
- * (контейнер pgvector/pgvector), локально и в проверках — PGlite, тот же
- * Postgres, собранный в WebAssembly, с тем же расширением. Код обращается к
- * обоим через один маленький интерфейс, поэтому SQL здесь общий.
+ * База: Postgres с расширением pgvector. В бою — облачный Postgres (Supabase,
+ * Neon — что угодно с pgvector) или свой контейнер pgvector/pgvector; локально
+ * и в проверках — PGlite, тот же Postgres, собранный в WebAssembly, с тем же
+ * расширением. Код обращается к ним через один маленький интерфейс, поэтому
+ * SQL здесь общий.
  */
 
+import { readFileSync } from "node:fs";
 import { logger } from "./log.ts";
 
 const log = logger("db");
@@ -17,22 +19,96 @@ export interface Db {
   close(): Promise<void>;
 }
 
-export async function openDb(url: string): Promise<Db> {
-  if (url.startsWith("pglite://") || url === "memory://") return openPglite(url);
-  return openPostgres(url);
+export interface PostgresOptions {
+  /** Корневой сертификат сервера (PEM или путь к файлу) — у Supabase свой, не публичный. */
+  caCert?: string;
+  poolSize?: number;
 }
 
-async function openPostgres(url: string): Promise<Db> {
+export async function openDb(url: string, options: PostgresOptions = {}): Promise<Db> {
+  if (url.startsWith("pglite://") || url === "memory://") return openPglite(url);
+  return openPostgres(url, options);
+}
+
+/**
+ * Настройки подключения из строки и окружения. Строку разбираем сами: иначе
+ * параметры из неё перекрывают переданный отдельно сертификат.
+ */
+export async function postgresConfig(url: string, options: PostgresOptions = {}) {
+  const { parse } = await import("pg-connection-string");
+  const parsed = parse(url) as Record<string, any>;
+  const params = new URL(url).searchParams;
+
+  let ssl = parsed.ssl;
+  if (options.caCert) {
+    const ca = options.caCert.includes("-----BEGIN") ? options.caCert : readFileSync(options.caCert, "utf8");
+    ssl = { ...(typeof ssl === "object" ? ssl : {}), ca, rejectUnauthorized: true };
+  }
+  const host = String(parsed.host ?? "");
+  if (params.get("pgbouncer") === "true" || (String(parsed.port) === "6543" && /pooler\.supabase\.com$/.test(host))) {
+    log.warn(
+      "это пулер в режиме транзакций: сервис держит соединения постоянно — берите Session pooler (порт 5432) или прямое подключение",
+    );
+  }
+  return {
+    user: parsed.user,
+    password: parsed.password,
+    host: parsed.host,
+    port: parsed.port ? Number(parsed.port) : undefined,
+    database: parsed.database,
+    ssl,
+    // Neon кладёт в строку channel_binding=require: pg умеет его, но только по флагу.
+    enableChannelBinding: params.get("channel_binding") === "require",
+    max: options.poolSize ?? 5,
+    // Облачные базы и NAT рвут простаивающие соединения — держим их живыми
+    // и не храним простаивающие долго.
+    keepAlive: true,
+    idleTimeoutMillis: 30_000,
+    connectionTimeoutMillis: 20_000,
+  };
+}
+
+/** Понятное объяснение частых ошибок подключения к облачным базам. */
+export function explainConnectionError(error: unknown, url: string): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const code = (error as { code?: string })?.code;
+  let host = "";
+  try {
+    host = new URL(url).hostname;
+  } catch {}
+  if ((code === "ENETUNREACH" || code === "EHOSTUNREACH" || code === "ENOTFOUND") && /^db\..+\.supabase\.co$/.test(host)) {
+    return `${message} — прямое подключение Supabase на бесплатном тарифе только по IPv6. Возьмите строку Session pooler (Connect → Session pooler)`;
+  }
+  if (/self[- ]signed certificate|unable to verify|UNABLE_TO_GET_ISSUER/i.test(message)) {
+    return `${message} — у Supabase свой корневой сертификат: скачайте его (Database Settings → SSL Configuration) и укажите в DATABASE_CA_CERT`;
+  }
+  if (/password authentication failed/i.test(message)) return `${message} — неверный пароль в DATABASE_URL`;
+  if (/extension "vector" is not available|could not open extension control file/i.test(message)) {
+    return `${message} — на сервере нет pgvector: нужен Postgres с этим расширением (Supabase и Neon его имеют)`;
+  }
+  return message;
+}
+
+async function openPostgres(url: string, options: PostgresOptions): Promise<Db> {
   const { default: pg } = await import("pg");
   // int8 — идентификаторы каналов Telegram. Они меньше 2^53, число без потерь.
   pg.types.setTypeParser(20, (value: string) => Number(value));
-  const pool = new pg.Pool({ connectionString: url, max: 10 });
+  const pool = new pg.Pool(await postgresConfig(url, options));
   pool.on("connect", (client) => {
     // pgvector ≥ 0.8: при фильтрах по каналу и дате индекс добирает кандидатов,
     // а не отдаёт меньше запрошенного.
     client.query("SET hnsw.iterative_scan = relaxed_order").catch(() => {});
   });
-  pool.on("error", (error) => log.error("соединение с базой оборвалось", error));
+  // Облачная база может усыпить вычисления или перезапуститься: соединение
+  // из пула выбрасывается, следующий запрос откроет новое.
+  pool.on("error", (error) => log.warn("соединение с базой оборвалось, будет открыто новое", error));
+
+  try {
+    await pool.query("SELECT 1");
+  } catch (error) {
+    await pool.end().catch(() => {});
+    throw new Error(`не удалось подключиться к базе: ${explainConnectionError(error, url)}`);
+  }
   return {
     async query(sql, params = []) {
       const result = await pool.query(sql, params as unknown[]);
