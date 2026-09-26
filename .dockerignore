@@ -1,0 +1,11 @@
+# Секреты, сессии и локальное состояние в образ не попадают.
+.env
+.env.*
+!.env.example
+*.session
+data/
+node_modules/
+tests/
+deploy/
+.git/
+.github/

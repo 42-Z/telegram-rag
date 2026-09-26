@@ -1,0 +1,32 @@
+# Локальный запуск всего стека из исходников: docker compose up --build
+# Значения берутся из .env рядом (см. .env.example).
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://telegram_rag:telegram_rag@db:5432/telegram_rag
+    ports:
+      - "127.0.0.1:${APP_PORT:-8000}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: telegram_rag
+      POSTGRES_PASSWORD: telegram_rag
+      POSTGRES_DB: telegram_rag
+    volumes:
+      - db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U telegram_rag"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  db:

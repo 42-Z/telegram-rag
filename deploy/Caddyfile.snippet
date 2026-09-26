@@ -1,0 +1,10 @@
+# Дописать в /etc/caddy/Caddyfile на VPS, затем `systemctl reload caddy`.
+# Домен — заменить на выбранный. /health наружу не отдаётся: он для
+# проверки контейнера.
+
+telegram-rag.zomb.top {
+	import common
+	@health path /health
+	respond @health 404
+	reverse_proxy 127.0.0.1:8110
+}

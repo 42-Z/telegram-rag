@@ -1,0 +1,35 @@
+{
+  "name": "telegram-rag",
+  "version": "0.1.0-beta",
+  "private": true,
+  "type": "module",
+  "description": "База знаний по Telegram-каналам для любых нейросетей: userbot, эмбеддинги, векторный поиск через MCP и HTTP",
+  "engines": {
+    "node": ">=24.12"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.1.1",
+    "@modelcontextprotocol/sdk": "^1.30.1",
+    "big-integer": "^1.6.52",
+    "hono": "^4.13.9",
+    "openai": "^7.23.0",
+    "pg": "^8.23.0",
+    "teleproto": "^1.229.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8",
+    "@electric-sql/pglite-pgvector": "^0.0.9",
+    "@types/node": "^26.6.3",
+    "@types/pg": "^8.23.1",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.2"
+  },
+  "scripts": {
+    "start": "node src/main.ts",
+    "dev": "node --env-file-if-exists=.env --watch src/main.ts",
+    "login": "node --env-file-if-exists=.env src/cli/login.ts",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json"
+  }
+}

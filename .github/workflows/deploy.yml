@@ -1,0 +1,117 @@
+# Сборка образа на main, выкладка в GHCR, выкатка на VPS по SSH — как в Mimic42.
+#
+# Настройка репозитория (один раз, мейнтейнером):
+# - Secrets: DEPLOY_SSH_KEY (ed25519 без пароля), DEPLOY_HOST, DEPLOY_USER,
+#   DEPLOY_KNOWN_HOSTS (вывод `ssh-keyscan`, отпечаток сверен с консолью VPS).
+# - Variables: DEPLOY_PATH (/root/sites/telegram-rag), DEPLOY_PORT (22),
+#   PUBLIC_URL (https://telegram-rag.zomb.top) — для проверки после выкатки.
+# - Пакет ghcr.io/42-z/telegram-rag переключить в PUBLIC, чтобы сервер
+#   скачивал образ без docker login.
+
+name: Deploy
+
+# Бета: выкатка только вручную (Actions → Deploy → Run workflow), пока сервер
+# и секреты репозитория не настроены. Потом вернуть автозапуск:
+#   push:
+#     branches: [main]
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: production-deploy-telegram-rag
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/42-z/telegram-rag
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [test]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=telegram-rag
+          cache-to: type=gha,mode=max,scope=telegram-rag
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [build]
+    timeout-minutes: 15
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      - name: Copy compose files
+        run: |
+          scp -i ~/.ssh/deploy_key -P "${{ vars.DEPLOY_PORT }}" \
+            deploy/docker-compose.yml deploy/deploy.sh \
+            "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:${{ vars.DEPLOY_PATH }}/"
+
+      - name: Roll out
+        run: |
+          ssh -i ~/.ssh/deploy_key -p "${{ vars.DEPLOY_PORT }}" \
+            -o StrictHostKeyChecking=yes \
+            "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
+            "cd ${{ vars.DEPLOY_PATH }} && bash deploy.sh sha-${{ github.sha }}"
+
+      - name: Smoke test
+        run: |
+          set -e
+          code=""
+          for i in 1 2 3; do
+            code="$(curl -s -o /dev/null -w '%{http_code}' "${{ vars.PUBLIC_URL }}/")"
+            echo "GET / -> ${code} (attempt ${i})"
+            test "${code}" = "200" && break
+            sleep 10
+          done
+          test "${code}" = "200"
+
+      - name: Remove SSH key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
