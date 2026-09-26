@@ -14,12 +14,14 @@
     "hono": "^4.13.9",
     "openai": "^7.23.0",
     "pg": "^8.23.0",
+    "pg-connection-string": "^2.14.0",
     "teleproto": "^1.229.0",
     "zod": "^4.6.5"
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.8",
     "@electric-sql/pglite-pgvector": "^0.0.9",
+    "@electric-sql/pglite-socket": "^0.2.11",
     "@types/node": "^26.6.3",
     "@types/pg": "^8.23.1",
     "typescript": "^7.0.2",

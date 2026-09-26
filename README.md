@@ -14,7 +14,7 @@
 ## Как это работает
 
 ```
-Telegram (MTProto)                telegram-rag (один процесс)                  Postgres + pgvector
+Telegram (MTProto)                telegram-rag (один процесс)                  Postgres + pgvector (Supabase/Neon)
 ──────────────────               ─────────────────────────────                ───────────────────
 история канала      ──────────▶  Ingestor: история → живые обновления  ─────▶  channels
 новые посты, правки,             → догоняющий опрос раз в 5 минут              posts (целиком: текст,
@@ -141,13 +141,12 @@ npm run login                # телефон → код → (пароль 2FA) 
 npm run dev                  # локально, база — PGlite в ./data, Docker не нужен
 ```
 
-Весь стек в Docker (приложение + Postgres с pgvector):
+База — любой Postgres с pgvector по строке `DATABASE_URL`: в бою облачная
+(Supabase или Neon), локально — встроенная PGlite в `./data` или контейнер
+(`docker compose up --build` поднимает приложение и Postgres с pgvector).
+Схему сервис создаёт сам.
 
-```bash
-docker compose up --build
-```
-
-Боевое развёртывание на VPS (образ из GHCR, системный Caddy, автоматический
+Боевое развёртывание на VPS с облачной базой — как завести Supabase или Neon и чем они отличаются по лимитам (образ из GHCR, системный Caddy, автоматический
 откат) — [deploy/README.md](./deploy/README.md).
 
 ### Аккаунт для userbot'а
@@ -205,7 +204,7 @@ ffmpeg — настоящий, на сгенерированных голосо�
 src/
   main.ts              вход: база → индексатор → userbot → HTTP
   config.ts            переменные окружения
-  db.ts                Postgres / PGlite, схема, переиндексация при смене модели
+  db.ts                Postgres (Supabase, Neon, свой) / PGlite, схема, переиндексация при смене модели
   store.ts             каналы, посты, куски, поиск по смыслу и словам
   embeddings.ts        любой OpenAI-совместимый сервис эмбеддингов
   chunks.ts            нарезка поста на куски с шапкой «канал, дата»

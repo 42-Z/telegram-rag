@@ -25,8 +25,14 @@ const schema = z.object({
   /** Адрес сервиса снаружи — для OpenAPI и подсказок по подключению. */
   PUBLIC_URL: optional,
 
-  /** postgres://… для боя, pglite://<папка> для локального запуска без Postgres. */
+  /**
+   * postgres://… — облачная база (Supabase, Neon) или свой Postgres с pgvector;
+   * pglite://<папка> — локальный запуск без Postgres.
+   */
   DATABASE_URL: z.string().default("pglite://./data/pglite"),
+  /** Корневой сертификат базы (PEM целиком или путь к файлу) — нужен для Supabase. */
+  DATABASE_CA_CERT: optional,
+  DATABASE_POOL_SIZE: z.coerce.number().int().min(1).max(50).default(5),
 
   TELEGRAM_API_ID: z.coerce.number().int().optional(),
   TELEGRAM_API_HASH: optional,

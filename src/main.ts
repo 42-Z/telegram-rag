@@ -7,7 +7,7 @@
 
 import { serve } from "@hono/node-server";
 import { loadConfig } from "./config.ts";
-import { migrate, openDb } from "./db.ts";
+import { explainConnectionError, migrate, openDb } from "./db.ts";
 import { createEmbedder, type Embedder } from "./embeddings.ts";
 import { createApp } from "./http.ts";
 import { Indexer } from "./indexer.ts";
@@ -22,8 +22,16 @@ const log = logger("main");
 const config = loadConfig();
 setLogLevel(config.LOG_LEVEL);
 
-const db = await openDb(config.DATABASE_URL);
-await migrate(db, { model: config.EMBEDDING_MODEL, dimensions: config.EMBEDDING_DIMENSIONS });
+let db: Awaited<ReturnType<typeof openDb>>;
+try {
+  db = await openDb(config.DATABASE_URL, { caCert: config.DATABASE_CA_CERT, poolSize: config.DATABASE_POOL_SIZE });
+  await migrate(db, { model: config.EMBEDDING_MODEL, dimensions: config.EMBEDDING_DIMENSIONS });
+} catch (error) {
+  // openDb уже объясняет ошибки подключения; здесь — ошибки схемы (нет pgvector и т. п.)
+  const connect = error instanceof Error && error.message.startsWith("не удалось подключиться");
+  log.error(connect ? (error as Error).message : explainConnectionError(error, config.DATABASE_URL));
+  process.exit(1);
+}
 const store = new Store(db);
 
 let embedder: Embedder | undefined;

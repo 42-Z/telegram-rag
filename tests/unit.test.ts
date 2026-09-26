@@ -69,6 +69,7 @@ describe("normalizeMessage", () => {
     expect(tidyMarkdown("**MellSher****, ****5opka**** — Opus**")).toBe("**MellSher, 5opka — Opus**");
     expect(tidyMarkdown("**Magnum**** ****Opus**** — это...**")).toBe("**Magnum Opus — это...**");
     expect(tidyMarkdown("__курсив__ и **жирный**")).toBe("__курсив__ и **жирный**");
+    expect(tidyMarkdown("**__Новый **__**__альбом**__**__ скоро__**")).toBe("**__Новый альбом скоро__**");
   });
 
   it("служебные сообщения не посты", () => {

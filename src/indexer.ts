@@ -86,7 +86,7 @@ export class Indexer {
   }
 
   /** Постоянный цикл: пока есть очередь — без пауз, иначе ждёт сигнала или таймера. */
-  start(idleMs = 5_000): void {
+  start(idleMs = 60_000): void {
     const loop = async () => {
       if (this.stopped) return;
       this.running = true;

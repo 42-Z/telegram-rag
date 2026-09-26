@@ -184,7 +184,8 @@ export function isPost(message: MessageLike): boolean {
  * вместо «**a, b**». Пустые пары маркеров смысла не несут и мешают поиску.
  */
 export function tidyMarkdown(text: string): string {
-  return text.replace(/(\*\*|__|~~)\1/g, "");
+  // пары одинаковых маркеров и сочетания жирного с курсивом: «****», «**__**__»
+  return text.replace(/(\*\*__|__\*\*|\*\*|__|~~)\1/g, "");
 }
 
 export function normalizeMessage(channelId: number, message: MessageLike): PostRecord {

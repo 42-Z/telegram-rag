@@ -116,7 +116,7 @@ export class MediaProcessor {
     return jobs.length;
   }
 
-  start(idleMs = 10_000): void {
+  start(idleMs = 60_000): void {
     const loop = async () => {
       while (!this.stopped) {
         let processed = 0;

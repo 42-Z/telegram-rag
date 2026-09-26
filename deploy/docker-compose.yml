@@ -1,14 +1,13 @@
 # Боевой стек на VPS — по образцу Mimic42.
 #
-# Образ приложения собирает GitHub Actions (.github/workflows/deploy.yml) и
-# кладёт в ghcr.io; сервер только скачивает и перезапускает. Секреты — в
-# /etc/telegram-rag.env (права 600, создаётся руками, в репозиторий не
-# попадает); переменные уровня compose — в .env рядом (пишет deploy.sh).
+# База — облачный Postgres (Supabase или Neon), на сервере её нет: строка
+# подключения DATABASE_URL лежит в /etc/telegram-rag.env вместе с остальными
+# секретами (права 600, создаётся руками, в репозиторий не попадает).
+# Переменные уровня compose — в .env рядом (пишет deploy.sh).
 #
-# Порт приложения опубликован только на loopback: снаружи его отдаёт
-# системный Caddy (см. Caddyfile.snippet). База наружу не опубликована вовсе
-# и доступна лишь приложению во внутренней сети compose, поэтому пароль у неё
-# постоянный и не секретный.
+# Образ собирает GitHub Actions (.github/workflows/deploy.yml) и кладёт в
+# ghcr.io; сервер только скачивает и перезапускает. Порт опубликован только
+# на loopback: снаружи его отдаёт системный Caddy (см. Caddyfile.snippet).
 
 services:
   app:
@@ -19,13 +18,8 @@ services:
     env_file:
       - path: /etc/telegram-rag.env
         required: true
-    environment:
-      DATABASE_URL: postgres://telegram_rag:telegram_rag@db:5432/telegram_rag
     ports:
       - "127.0.0.1:${APP_PORT:-8110}:8000"
-    depends_on:
-      db:
-        condition: service_healthy
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8000/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
       interval: 30s
@@ -36,26 +30,3 @@ services:
     mem_reservation: 256m
     security_opt:
       - no-new-privileges:true
-
-  db:
-    image: pgvector/pgvector:pg17
-    container_name: telegram-rag-db
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: telegram_rag
-      POSTGRES_PASSWORD: telegram_rag
-      POSTGRES_DB: telegram_rag
-    volumes:
-      - db:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U telegram_rag"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-    mem_limit: 1g
-    security_opt:
-      - no-new-privileges:true
-
-volumes:
-  db:
-    name: telegram-rag-db
