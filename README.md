@@ -8,24 +8,37 @@
 строит эмбеддинги и отдаёт посты ассистентам: через MCP, REST/OpenAPI и
 готовые описания функций для function calling.
 
-Младший брат [twitch-rag](https://github.com/42-Z/twitch-rag): тот же принцип
-(знания → векторы → MCP), только вместо записей эфиров — посты каналов.
-
 ## Как это работает
 
-```
-Telegram (MTProto)                telegram-rag (один процесс)                  Postgres + pgvector (Supabase/Neon)
-──────────────────               ─────────────────────────────                ───────────────────
-история канала      ──────────▶  Ingestor: история → живые обновления  ─────▶  channels
-новые посты, правки,             → догоняющий опрос раз в 5 минут              posts (целиком: текст,
-  удаления (watch)                                                              медиа, альбомы, реакции,
-фото, голосовые,    ──────────▶  MediaProcessor: ffmpeg → Gemini       ─────▶   пересылки, просмотры,
-  кружки                           (расшифровка, описание, OCR)                 расшифровки и описания)
-                                 Indexer: куски → эмбеддинги пачками  ─────▶
-                                   (OpenRouter · Gemini, или любой              chunks (векторы, HNSW)
-                                    OpenAI-совместимый сервис)                  + полнотекстовый индекс
+```mermaid
+flowchart LR
+  subgraph Telegram["Telegram (MTProto)"]
+    history["История каналов"]
+    updates["Новые посты, правки и удаления"]
+    media["Фото, голосовые и кружки"]
+  end
 
-любая нейросеть     ◀──────────  /mcp · /api/tools/* · /openapi.json · /api/tools (function calling)
+  subgraph Service["telegram-rag (один процесс)"]
+    ingest["Ingestor<br/>История и живые обновления<br/>Догоняющий опрос раз в 5 минут"]
+    mediaProcessor["MediaProcessor<br/>ffmpeg → мультимодальная модель<br/>Расшифровка, описание и OCR"]
+    indexer["Indexer<br/>Фрагменты → эмбеддинги пачками"]
+    api["MCP · REST · OpenAPI<br/>Function calling"]
+  end
+
+  db[("Postgres + pgvector<br/>channels · posts · chunks<br/>Векторы и полнотекстовый индекс")]
+  llm["Любая нейросеть"]
+
+  history --> ingest
+  updates --> ingest
+  ingest --> db
+  media --> mediaProcessor
+  mediaProcessor --> db
+  db --> indexer
+  indexer --> db
+  llm -->|Вызовы инструментов| api
+  api -->|Найденные посты| llm
+  api -->|Запросы| db
+  db -->|Результаты| api
 ```
 
 - **История.** При добавлении канала читается вся история (или последние
@@ -153,8 +166,8 @@ npm run dev                  # локально, база — PGlite в ./data, 
 
 Лучше отдельный аккаунт, а не личный: сессия даёт полный доступ к нему. Одна
 сессия — один запущенный процесс: две копии с одной сессией выбивают друг
-друга (как и у Mimic42). Для локальной разработки заводите вторую сессию
-(`npm run login` ещё раз).
+друга. Для локальной разработки заводите вторую сессию (`npm run login` ещё
+раз).
 
 ### Медиа
 
