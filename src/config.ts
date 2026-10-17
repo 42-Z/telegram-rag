@@ -20,6 +20,16 @@ const list = z
       .filter(Boolean),
   );
 
+const httpUrl = optional.pipe(
+  z
+    .string()
+    .url()
+    .refine((value) => ["http:", "https:"].includes(new URL(value).protocol), {
+      message: "S3_ENDPOINT must use http or https",
+    })
+    .optional(),
+);
+
 const schema = z.object({
   PORT: z.coerce.number().int().default(8000),
   /** Адрес сервиса снаружи — для OpenAPI и подсказок по подключению. */
@@ -77,12 +87,54 @@ const schema = z.object({
   MEDIA_MAX_SECONDS: z.coerce.number().int().positive().default(1800),
   MEDIA_CONCURRENCY: z.coerce.number().int().min(1).max(16).default(2),
 
+  /** S3-compatible хранилище оригиналов медиа. Endpoint не нужен для AWS S3. */
+  S3_ENDPOINT: httpUrl,
+  S3_REGION: optional,
+  S3_BUCKET: optional,
+  S3_ACCESS_KEY_ID: optional,
+  S3_SECRET_ACCESS_KEY: optional,
+  S3_SESSION_TOKEN: optional,
+  S3_FORCE_PATH_STYLE: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((value) => value === "true"),
+  S3_URL_TTL_SECONDS: z.coerce.number().int().min(1).default(3600),
+
   /** Если задан — чтение знаний (MCP и API) только с `Authorization: Bearer <токен>`. */
   API_TOKEN: optional,
   /** Токен владельца: добавление и удаление каналов. Без него управление выключено. */
   ADMIN_TOKEN: optional,
 
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
+}).superRefine((config, ctx) => {
+  const required = [
+    "S3_REGION",
+    "S3_BUCKET",
+    "S3_ACCESS_KEY_ID",
+    "S3_SECRET_ACCESS_KEY",
+  ] as const;
+  const anyStorageSetting = [
+    config.S3_ENDPOINT,
+    config.S3_REGION,
+    config.S3_BUCKET,
+    config.S3_ACCESS_KEY_ID,
+    config.S3_SECRET_ACCESS_KEY,
+    config.S3_SESSION_TOKEN,
+  ].some((value) => value !== undefined);
+
+  if (config.MEDIA_TYPES.length === 0 && !anyStorageSetting) return;
+
+  const missing = required.filter((key) => !config[key]);
+  if (missing.length === 0) return;
+
+  const reason = config.MEDIA_TYPES.length > 0
+    ? "S3 is required while MEDIA_TYPES is enabled"
+    : "S3 configuration is incomplete";
+  ctx.addIssue({
+    code: "custom",
+    path: ["S3_BUCKET"],
+    message: `${reason}; configure ${missing.join(", ")}. S3_ENDPOINT is optional.`,
+  });
 });
 
 export type Config = ReturnType<typeof loadConfig>;
