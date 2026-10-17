@@ -8,6 +8,8 @@ const CONNECTION_TIMEOUT_MS = 5_000;
 const REQUEST_TIMEOUT_MS = 30_000;
 const MAX_ATTEMPTS = 3;
 const OBJECT_KEY_PATTERN = /^sha256\/[a-f0-9]{64}$/;
+const FILENAME_METADATA_KEY = "filename";
+const S3_USER_METADATA_MAX_BYTES = 2_048;
 
 export interface S3StorageConfig {
   endpoint?: string;
@@ -72,6 +74,13 @@ class S3ObjectStorage implements ObjectStorage {
     if (input.filename !== undefined && /[\r\n\0]/.test(input.filename)) {
       throw new TypeError("Filename metadata cannot contain control characters");
     }
+    const encodedFilename = input.filename === undefined ? undefined : encodeURIComponent(input.filename);
+    const filenameMetadataBytes = encodedFilename === undefined
+      ? 0
+      : Buffer.byteLength(FILENAME_METADATA_KEY, "utf8") + Buffer.byteLength(encodedFilename, "utf8");
+    if (filenameMetadataBytes > S3_USER_METADATA_MAX_BYTES) {
+      throw new TypeError(`Filename metadata exceeds S3's ${S3_USER_METADATA_MAX_BYTES}-byte user metadata limit`);
+    }
 
     // Copy once so the digest, length, and bytes sent to S3 all describe the same snapshot.
     const bytes = Buffer.from(input.bytes);
@@ -85,9 +94,9 @@ class S3ObjectStorage implements ObjectStorage {
         Body: bytes,
         ContentLength: bytes.byteLength,
         ContentType: input.contentType,
-        ...(input.filename === undefined
+        ...(encodedFilename === undefined
           ? {}
-          : { Metadata: { filename: encodeURIComponent(input.filename) } }),
+          : { Metadata: { [FILENAME_METADATA_KEY]: encodedFilename } }),
       }),
     );
 

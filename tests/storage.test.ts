@@ -171,6 +171,28 @@ describe("S3-compatible object storage", () => {
     expect(new URL(get!.url, endpoint).pathname).toBe(`/${BUCKET}/${stored.key}`);
   });
 
+  it("keeps filename metadata within the 2048-byte S3 limit and rejects overflow before PUT", async () => {
+    const storage = makeStorage();
+    const contentType = "text/plain";
+
+    await storage.saveOriginal({
+      bytes: Buffer.from("metadata at limit"),
+      contentType,
+      filename: "я".repeat(340),
+    });
+    expect(requests.filter((request) => request.method === "PUT")).toHaveLength(1);
+    expect(Buffer.byteLength(String(requests[0]!.headers["x-amz-meta-filename"]), "utf8")).toBe(2040);
+
+    const oversizedUpload = storage.saveOriginal({
+      bytes: Buffer.from("metadata over limit"),
+      contentType,
+      filename: "я".repeat(341),
+    });
+    await expect(oversizedUpload).rejects.toThrow(TypeError);
+    await expect(oversizedUpload).rejects.toThrow(/2048-byte/);
+    expect(requests.filter((request) => request.method === "PUT")).toHaveLength(1);
+  });
+
   it("uses the configured endpoint and signs a direct path-style GET URL", async () => {
     const storage = makeStorage();
     const key = testKey(Buffer.from("original"));

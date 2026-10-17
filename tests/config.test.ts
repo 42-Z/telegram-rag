@@ -36,6 +36,20 @@ describe("S3 configuration", () => {
     });
   });
 
+  it("allows HTTP only for loopback endpoints and requires HTTPS for public hosts", () => {
+    for (const host of ["localhost", "127.0.0.1", "127.255.255.254", "[::1]"]) {
+      const config = loadConfig({ ...storageEnv, S3_ENDPOINT: `http://${host}:9000` });
+      expect(config.S3_ENDPOINT).toBe(`http://${host}:9000`);
+    }
+
+    expect(() =>
+      loadConfig({ ...storageEnv, S3_ENDPOINT: "http://objects.example.test:9000" }),
+    ).toThrow(/S3_ENDPOINT must use HTTPS/);
+    expect(
+      loadConfig({ ...storageEnv, S3_ENDPOINT: "https://objects.example.test" }).S3_ENDPOINT,
+    ).toBe("https://objects.example.test");
+  });
+
   it("requires complete storage configuration when media types are enabled", () => {
     expect(() => loadConfig({ MEDIA_TYPES: "photo" })).toThrow(/S3 is required while MEDIA_TYPES is enabled/);
     expect(() => loadConfig({ ...storageEnv, S3_SECRET_ACCESS_KEY: "" })).toThrow(/S3_SECRET_ACCESS_KEY/);
@@ -49,5 +63,10 @@ describe("S3 configuration", () => {
   it("rejects malformed endpoints and invalid URL TTLs", () => {
     expect(() => loadConfig({ ...storageEnv, S3_ENDPOINT: "ftp://objects.example.test" })).toThrow();
     expect(() => loadConfig({ ...storageEnv, S3_URL_TTL_SECONDS: "0" })).toThrow();
+  });
+
+  it("accepts the SigV4 maximum URL TTL and rejects the next second", () => {
+    expect(loadConfig({ ...storageEnv, S3_URL_TTL_SECONDS: "604800" }).S3_URL_TTL_SECONDS).toBe(604800);
+    expect(() => loadConfig({ ...storageEnv, S3_URL_TTL_SECONDS: "604801" })).toThrow();
   });
 });

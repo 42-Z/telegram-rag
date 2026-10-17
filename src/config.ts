@@ -3,6 +3,7 @@
  * развёртывания или от выбранной модели, живёт здесь, а не в коде.
  */
 
+import { isIP } from "node:net";
 import { z } from "zod";
 
 const optional = z
@@ -20,12 +21,21 @@ const list = z
       .filter(Boolean),
   );
 
+function isLoopbackHostname(hostname: string): boolean {
+  const host = hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  if (host === "localhost" || host === "localhost." || host === "::1") return true;
+  return isIP(host) === 4 && host.startsWith("127.");
+}
+
 const httpUrl = optional.pipe(
   z
     .string()
     .url()
-    .refine((value) => ["http:", "https:"].includes(new URL(value).protocol), {
-      message: "S3_ENDPOINT must use http or https",
+    .refine((value) => {
+      const url = new URL(value);
+      return url.protocol === "https:" || (url.protocol === "http:" && isLoopbackHostname(url.hostname));
+    }, {
+      message: "S3_ENDPOINT must use HTTPS for non-loopback hosts",
     })
     .optional(),
 );
@@ -98,7 +108,7 @@ const schema = z.object({
     .enum(["true", "false"])
     .default("true")
     .transform((value) => value === "true"),
-  S3_URL_TTL_SECONDS: z.coerce.number().int().min(1).default(3600),
+  S3_URL_TTL_SECONDS: z.coerce.number().int().min(1).max(604_800).default(3600),
 
   /** Если задан — чтение знаний (MCP и API) только с `Authorization: Bearer <токен>`. */
   API_TOKEN: optional,
