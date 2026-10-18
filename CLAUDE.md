@@ -21,12 +21,27 @@ MCP (`/mcp`), REST/OpenAPI и описания функций для function ca
   node_modules/teleproto, а не по памяти о GramJS: API разошлись (`client.updates`).
 - Цифры (цены, размеры, лимиты) — только из документации или из ответа сервиса.
 - Одна сессия Telegram — один процесс. Локально — своя сессия, не боевая.
-- Изменения — в отдельной ветке с Pull Request; слияние в `main` выкатывает на VPS.
+- Изменения — в отдельной ветке с Pull Request; в `main` — только с зелёным CI.
+  На VPS выкатывает вручную workflow Deploy, слияние в `main` само ничего не выкатывает.
+- Не опирайся лишь на описания и комментарии, проверяй как все устроено на самом деле
 
 ## Проверки
 
-- `npm test` — без сети: PGlite с pgvector, подменённые эмбеддинги и клиент Telegram
+- `npm test` — без сети: PGlite с pgvector, подменённые эмбеддинги и клиент Telegram;
+  нужен настоящий ffmpeg (tests/media.test.ts)
 - `npm run typecheck`
+
+## CI и выкатка
+
+- `.github/workflows/ci.yml` — typecheck и тесты на каждом PR и пуше в `main`.
+  Новую проверку добавляй сюда: Deploy вызывает этот же файл.
+- `.github/workflows/deploy.yml` — только вручную (Actions → Deploy), только из `main`:
+  CI → образ в GHCR → SSH и `deploy/deploy.sh` с откатом → проверка адреса снаружи.
+  Автовыкатки на пуш нет: секреты и окружение `production` в репозитории не заведены.
+- Экшены закреплены на SHA с версией в комментарии, обновляет Dependabot
+  (`.github/dependabot.yml`). Новый экшен — тоже на SHA.
+- Секреты и недоверенные значения передавай в `run` через `env`, не подстановкой `${{ }}`.
+- После правки workflow'ов: `uvx --with shellcheck-py --from actionlint-py actionlint`.
 
 ## Документация
 

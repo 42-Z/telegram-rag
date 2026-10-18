@@ -1,6 +1,6 @@
 # Развёртывание telegram-rag на VPS (Docker, Caddy, облачная база)
 
-Как у Mimic42: образ собирает GitHub Actions и кладёт в
+Образ собирает GitHub Actions и кладёт в
 `ghcr.io/42-z/telegram-rag`, на сервере ничего не собирается. Системный Caddy
 отдаёт домен наружу, приложение слушает только `127.0.0.1:8110`. **Базы на
 сервере нет** — это облачный Postgres с pgvector (Supabase или Neon), сервер
@@ -147,19 +147,28 @@ Neon: строку `DATABASE_CA_CERT` из секретов убрать, overri
 
 ## Репозиторий (один раз)
 
-- Secrets: `DEPLOY_SSH_KEY`, `DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_KNOWN_HOSTS` —
-  те же, что у Mimic42, если сервер тот же.
-- Variables: `DEPLOY_PATH=/root/sites/telegram-rag`, `DEPLOY_PORT=22`,
-  `PUBLIC_URL=https://telegram-rag.zomb.top`.
-- Environment `production`.
+Всё заводится в Settings → Environments → `production`: секреты окружения
+доступны только джобу выкатки.
+
+- Deployment branches — только `main`.
+- Secrets: `DEPLOY_SSH_KEY` (ed25519 без пароля), `DEPLOY_HOST`, `DEPLOY_USER`,
+  `DEPLOY_KNOWN_HOSTS` (вывод `ssh-keyscan`, отпечаток сверить с консолью VPS).
+- Variables: `DEPLOY_PATH=/root/sites/telegram-rag`,
+  `PUBLIC_URL=https://telegram-rag.zomb.top`, `DEPLOY_PORT` — только если порт не 22.
 - После первой сборки пакет `ghcr.io/42-z/telegram-rag` переключить в PUBLIC.
 
 ## Как проходит выкатка
 
-Пуш в `main` → проверки → сборка образа `ghcr.io/42-z/telegram-rag:sha-<sha>`
-(+ `latest`) → scp compose и `deploy.sh` → `bash deploy.sh sha-<sha>`. Скрипт
-ждёт здоровья контейнера 180 с и при неудаче сам откатывается на прежний тег.
-Все теги — в `releases.log`; ручной откат — `bash deploy.sh <тег>`.
+Вручную: Actions → Deploy → Run workflow, ветка `main` (из другой ветки workflow
+остановится сразу). Проверки (`ci.yml`) → сборка образа
+`ghcr.io/42-z/telegram-rag:sha-<sha>` (+ `latest`) → scp compose и `deploy.sh` →
+`bash deploy.sh sha-<sha>` → запрос к `PUBLIC_URL` снаружи. Скрипт ждёт здоровья
+контейнера 180 с и при неудаче сам откатывается на прежний тег. Все теги — в
+`releases.log`; ручной откат — `bash deploy.sh <тег>`.
+
+Слияние в `main` само ничего не выкатывает: пока секретов и окружения нет, каждый
+merge заканчивался бы ошибкой выкатки. Когда всё настроено, автозапуск включается
+добавлением `push: branches: [main]` в `on:` файла `deploy.yml`.
 
 ## Проверка после выкатки
 

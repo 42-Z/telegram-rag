@@ -1,0 +1,11 @@
+# Экшены в workflow'ах закреплены на SHA; Dependabot обновляет SHA и
+# комментарий с версией вместе.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
