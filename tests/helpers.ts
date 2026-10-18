@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { migrate, openDb, type Db } from "../src/db.ts";
-import type { Embedder, EmbeddingInput } from "../src/embeddings.ts";
+import type { Embedder, EmbeddingInput, Modality } from "../src/embeddings.ts";
 import { Store } from "../src/store.ts";
 import { normalizeMessage, type MessageLike } from "../src/telegram/normalize.ts";
 
@@ -11,10 +11,13 @@ export const DIMENSIONS = 64;
  * Тексты с общими словами оказываются рядом — этого хватает, чтобы проверить
  * путь поиска по смыслу целиком, от запроса до ответа.
  */
-export function fakeEmbedder(): Embedder & { calls: number } {
+export function fakeEmbedder(
+  modalities: readonly Modality[] = ["image", "audio", "video"],
+): Embedder & { calls: number } {
   const embedder = {
     model: "fake",
     dimensions: DIMENSIONS,
+    modalities: new Set(modalities) as ReadonlySet<Modality>,
     calls: 0,
     async embed(inputs: readonly EmbeddingInput[]) {
       embedder.calls += 1;

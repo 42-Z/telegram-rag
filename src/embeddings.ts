@@ -1,7 +1,14 @@
 /**
- * Прямые text/multimodal embeddings через OpenRouter-совместимый endpoint.
- * В запрос отправляется исходный текст и/или байты медиа; генерации анализа нет.
+ * Прямые мультимодальные embeddings: текст и/или байты медиа уходят в модель как
+ * есть, без генерации описаний. Два бэкенда с разным форматом запроса — OpenRouter
+ * (`/embeddings`, типизированный `content`) и Ollama (`/api/embed`, объекты
+ * `{text, image, audio}`). Текстовые модели не поддерживаются.
  */
+
+/** Типы медиа, которые модель может превратить в вектор; текст поддерживается всегда. */
+export const MODALITIES = ["image", "audio", "video"] as const;
+export type Modality = (typeof MODALITIES)[number];
+export type EmbeddingApi = "openrouter" | "ollama";
 
 export type EmbeddingPart =
   | { type: "text"; text: string }
@@ -14,15 +21,18 @@ export type EmbeddingInput =
 export interface Embedder {
   readonly model: string;
   readonly dimensions: number;
+  readonly modalities: ReadonlySet<Modality>;
   embed(inputs: readonly EmbeddingInput[]): Promise<number[][]>;
 }
 
 export interface EmbedderConfig {
+  api: EmbeddingApi;
   baseURL: string;
   apiKey: string | undefined;
   model: string;
   dimensions: number;
   sendDimensions: boolean;
+  modalities: readonly Modality[];
   maxRequestBytes?: number;
   timeoutMs?: number;
   fetch?: typeof fetch;
@@ -32,15 +42,6 @@ const MAX_ATTEMPTS = 3;
 const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504, 529]);
 const DEFAULT_MAX_REQUEST_BYTES = 32 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 60_000;
-
-function requestBody(config: EmbedderConfig, inputs: readonly EmbeddingInput[]): string {
-  return JSON.stringify({
-    model: config.model,
-    input: inputs.map(toRequestInput),
-    encoding_format: "float",
-    ...(config.sendDimensions ? { dimensions: config.dimensions } : {}),
-  });
-}
 
 function formatText(input: Extract<EmbeddingInput, { type: "text" }>): string {
   if (input.purpose === "query") return `task: search result | query: ${input.text}`;
@@ -64,7 +65,7 @@ function videoFormat(mimeType: string): string {
   throw new TypeError(`Unsupported video embedding MIME type: ${mimeType}`);
 }
 
-function toRequestInput(input: EmbeddingInput): { content: Array<Record<string, unknown>> } {
+function toOpenRouterInput(input: EmbeddingInput): { content: Array<Record<string, unknown>> } {
   if (input.type === "text") {
     return { content: [{ type: "text", text: formatText(input) }] };
   }
@@ -90,35 +91,101 @@ function toRequestInput(input: EmbeddingInput): { content: Array<Record<string, 
   };
 }
 
-interface EmbeddingResponse {
-  data?: Array<{ index?: number; embedding?: unknown }>;
-  error?: { message?: string };
+/**
+ * Ollama `/api/embed`: элемент `input` — строка либо объект с одним `image` и/или одним
+ * `audio` (base64). Видео Ollama не принимает.
+ */
+function toOllamaInput(input: EmbeddingInput): string | { text?: string; image?: string; audio?: string } {
+  if (input.type === "text") return formatText(input);
+
+  const item: { text?: string; image?: string; audio?: string } = {};
+  for (const part of input.parts) {
+    if (part.type === "text") {
+      if (part.text) item.text = item.text ? `${item.text}\n\n${part.text}` : part.text;
+      continue;
+    }
+    if (part.type === "video") throw new TypeError("Ollama does not accept video embedding input");
+    if (item[part.type] !== undefined) throw new TypeError(`Ollama accepts at most one ${part.type} per embedding input`);
+    item[part.type] = Buffer.from(part.data).toString("base64");
+  }
+  if (item.text === undefined && item.image === undefined && item.audio === undefined) {
+    throw new TypeError("A multimodal embedding input needs at least one content part");
+  }
+  return item;
 }
 
-function parseVectors(payload: unknown, count: number, dimensions: number, model: string): number[][] {
-  if (!payload || typeof payload !== "object" || !Array.isArray((payload as EmbeddingResponse).data)) {
-    throw new Error("Embedding endpoint returned an invalid response body");
-  }
-  const data = (payload as EmbeddingResponse).data!;
-  if (data.length !== count) throw new Error(`Embedding endpoint returned ${data.length} vectors for ${count} inputs`);
+/** Формат запроса и ответа одного бэкенда; повторы, таймаут и лимиты общие. */
+interface Backend {
+  /** Путь относительно `baseURL`. */
+  path: string;
+  headers: Record<string, string>;
+  body(config: EmbedderConfig, inputs: readonly EmbeddingInput[]): Record<string, unknown>;
+  /** Векторы в порядке входов; значения проверяет `checkVectors`. */
+  extract(payload: unknown, count: number): unknown[];
+}
 
-  const vectors = new Array<number[]>(count);
-  for (const row of data) {
-    if (!Number.isInteger(row.index) || row.index! < 0 || row.index! >= count || vectors[row.index!] !== undefined) {
-      throw new Error("Embedding endpoint returned invalid or duplicate vector indexes");
-    }
-    if (!Array.isArray(row.embedding) || row.embedding.some((value) => typeof value !== "number" || !Number.isFinite(value))) {
+interface OpenRouterResponse {
+  data?: Array<{ index?: number; embedding?: unknown }>;
+}
+
+interface OllamaResponse {
+  embeddings?: unknown;
+}
+
+const BACKENDS: Record<EmbeddingApi, Backend> = {
+  openrouter: {
+    path: "/embeddings",
+    headers: { "HTTP-Referer": "https://github.com/42-Z/telegram-rag", "X-Title": "telegram-rag" },
+    body: (config, inputs) => ({
+      model: config.model,
+      input: inputs.map(toOpenRouterInput),
+      encoding_format: "float",
+      ...(config.sendDimensions ? { dimensions: config.dimensions } : {}),
+    }),
+    extract(payload, count) {
+      if (!payload || typeof payload !== "object" || !Array.isArray((payload as OpenRouterResponse).data)) {
+        throw new Error("Embedding endpoint returned an invalid response body");
+      }
+      const data = (payload as OpenRouterResponse).data!;
+      if (data.length !== count) throw new Error(`Embedding endpoint returned ${data.length} vectors for ${count} inputs`);
+
+      const vectors = new Array<unknown>(count);
+      for (const row of data) {
+        if (!Number.isInteger(row.index) || row.index! < 0 || row.index! >= count || vectors[row.index!] !== undefined) {
+          throw new Error("Embedding endpoint returned invalid or duplicate vector indexes");
+        }
+        vectors[row.index!] = row.embedding;
+      }
+      return vectors;
+    },
+  },
+  ollama: {
+    path: "/api/embed",
+    headers: {},
+    body: (config, inputs) => ({
+      model: config.model,
+      input: inputs.map(toOllamaInput),
+      ...(config.sendDimensions ? { dimensions: config.dimensions } : {}),
+    }),
+    extract(payload, count) {
+      const embeddings = payload && typeof payload === "object" ? (payload as OllamaResponse).embeddings : undefined;
+      if (!Array.isArray(embeddings)) throw new Error("Embedding endpoint returned an invalid response body");
+      if (embeddings.length !== count) throw new Error(`Embedding endpoint returned ${embeddings.length} vectors for ${count} inputs`);
+      return embeddings;
+    },
+  },
+};
+
+function checkVectors(rows: readonly unknown[], dimensions: number, model: string): number[][] {
+  return rows.map((row) => {
+    if (!Array.isArray(row) || row.some((value) => typeof value !== "number" || !Number.isFinite(value))) {
       throw new Error("Embedding endpoint returned a non-numeric vector");
     }
-    if (row.embedding.length !== dimensions) {
-      throw new Error(`Model ${model} returned ${row.embedding.length} dimensions; EMBEDDING_DIMENSIONS=${dimensions}`);
+    if (row.length !== dimensions) {
+      throw new Error(`Model ${model} returned ${row.length} dimensions; EMBEDDING_DIMENSIONS=${dimensions}`);
     }
-    vectors[row.index!] = row.embedding as number[];
-  }
-  for (let index = 0; index < count; index += 1) {
-    if (vectors[index] === undefined) throw new Error("Embedding endpoint omitted a vector index");
-  }
-  return vectors;
+    return row as number[];
+  });
 }
 
 function wait(ms: number): Promise<void> {
@@ -127,18 +194,18 @@ function wait(ms: number): Promise<void> {
 
 export function createEmbedder(config: EmbedderConfig): Embedder {
   const fetcher = config.fetch ?? fetch;
-  const endpoint = `${config.baseURL.replace(/\/+$/, "")}/embeddings`;
+  const backend = BACKENDS[config.api];
+  const endpoint = `${config.baseURL.replace(/\/+$/, "")}${backend.path}`;
   const maxBytes = config.maxRequestBytes ?? DEFAULT_MAX_REQUEST_BYTES;
   const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    "HTTP-Referer": "https://github.com/42-Z/telegram-rag",
-    "X-Title": "telegram-rag",
-  };
+  const modalities: ReadonlySet<Modality> = new Set(config.modalities);
+  const headers: Record<string, string> = { "Content-Type": "application/json", ...backend.headers };
   if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
 
+  const requestBody = (inputs: readonly EmbeddingInput[]): string => JSON.stringify(backend.body(config, inputs));
+
   const request = async (inputs: readonly EmbeddingInput[]): Promise<number[][]> => {
-    const body = requestBody(config, inputs);
+    const body = requestBody(inputs);
     if (Buffer.byteLength(body) > maxBytes) {
       throw new Error(`Embedding request exceeds EMBEDDING_MAX_REQUEST_MB (${maxBytes} serialized bytes)`);
     }
@@ -174,7 +241,7 @@ export function createEmbedder(config: EmbedderConfig): Embedder {
       } catch {
         throw new Error("Embedding endpoint returned malformed JSON");
       }
-      return parseVectors(payload, inputs.length, config.dimensions, config.model);
+      return checkVectors(backend.extract(payload, inputs.length), config.dimensions, config.model);
     }
     throw new Error("Embedding request exhausted retries");
   };
@@ -182,17 +249,18 @@ export function createEmbedder(config: EmbedderConfig): Embedder {
   return {
     model: config.model,
     dimensions: config.dimensions,
+    modalities,
     async embed(inputs) {
       if (inputs.length === 0) return [];
 
       const batches: EmbeddingInput[][] = [];
       let batch: EmbeddingInput[] = [];
       for (const input of inputs) {
-        if (Buffer.byteLength(requestBody(config, [input])) > maxBytes) {
+        if (Buffer.byteLength(requestBody([input])) > maxBytes) {
           throw new Error(`One embedding input exceeds EMBEDDING_MAX_REQUEST_MB (${maxBytes} serialized bytes)`);
         }
         const candidate = [...batch, input];
-        if (batch.length > 0 && Buffer.byteLength(requestBody(config, candidate)) > maxBytes) {
+        if (batch.length > 0 && Buffer.byteLength(requestBody(candidate)) > maxBytes) {
           batches.push(batch);
           batch = [input];
         } else batch = candidate;

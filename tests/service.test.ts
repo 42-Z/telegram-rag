@@ -229,10 +229,11 @@ describe("подключение любых моделей", () => {
   });
 });
 
-describe("без эмбеддингов", () => {
+describe("сбой сервиса эмбеддингов", () => {
   it("поиск откатывается на слова и говорит об этом", async () => {
-    const bare = createApp({ context: { store, embedder: undefined, storage } });
-    const response = await bare.request("/api/tools/search_posts", {
+    const failing = { ...embedder, embed: async () => { throw new Error("503 embedding unavailable"); } };
+    const degraded = createApp({ context: { store, embedder: failing, storage } });
+    const response = await degraded.request("/api/tools/search_posts", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ query: "борщ" }),

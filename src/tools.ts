@@ -19,7 +19,7 @@ const log = logger("tools");
 
 export interface ToolContext {
   store: Store;
-  embedder: Embedder | undefined;
+  embedder: Embedder;
   storage?: ObjectStorage;
   mediaTypes?: readonly string[];
 }
@@ -181,18 +181,13 @@ export const TOOLS: ToolDef[] = [
 
       let semantic: SearchHit[] = [];
       if (mode !== "keyword") {
-        if (!embedder) {
-          notice = "сервис эмбеддингов не настроен — поиск только по словам";
+        try {
+          const [vector] = await embedder.embed([{ type: "text", purpose: "query", text: args.query }]);
+          semantic = await store.semanticSearch(vector!, filter, mode === "hybrid" ? limit * 2 : limit);
+        } catch (error) {
+          log.warn("поиск по смыслу не удался", error);
+          notice = "поиск по смыслу временно недоступен — результат только по словам";
           mode = "keyword";
-        } else {
-          try {
-            const [vector] = await embedder.embed([{ type: "text", purpose: "query", text: args.query }]);
-            semantic = await store.semanticSearch(vector!, filter, mode === "hybrid" ? limit * 2 : limit);
-          } catch (error) {
-            log.warn("поиск по смыслу не удался", error);
-            notice = "поиск по смыслу временно недоступен — результат только по словам";
-            mode = "keyword";
-          }
         }
       }
       const keyword = mode !== "semantic" ? await store.keywordSearch(args.query, filter, mode === "hybrid" ? limit * 2 : limit) : [];

@@ -1,6 +1,6 @@
 /** Technical media preparation only: probing, bounded re-encoding and segmentation. */
 
-import type { EmbeddingPart } from "../embeddings.ts";
+import type { EmbeddingPart, Modality } from "../embeddings.ts";
 import type { ChunkKind } from "../store.ts";
 import type { PostMedia } from "../telegram/normalize.ts";
 import { extractMediaSegment, prepareImage, probeMedia, type MediaProbe } from "./ffmpeg.ts";
@@ -37,6 +37,23 @@ const mimeByExtension: Record<string, string> = {
   webm: "video/webm",
   gif: "image/gif",
 };
+
+/** Какую модальность модели нужно уметь, чтобы построить вектор для вложения этого типа. */
+const modalityByMediaType = {
+  photo: "image",
+  voice: "audio",
+  audio: "audio",
+  video: "video",
+  video_note: "video",
+  gif: "video",
+} as const satisfies Record<string, Modality>;
+
+/** Все типы вложений, которые сохраняются в S3; векторы строятся только для поддерживаемых моделью. */
+export const MEDIA_TYPES: readonly string[] = Object.keys(modalityByMediaType);
+
+export function mediaModality(mediaType: string): Modality | undefined {
+  return (modalityByMediaType as Record<string, Modality>)[mediaType];
+}
 
 export function sniffMimeType(bytes: Buffer, media: PostMedia, probe: MediaProbe): string {
   if (bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";

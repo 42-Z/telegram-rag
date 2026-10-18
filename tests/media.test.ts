@@ -120,6 +120,7 @@ describe("direct media embedding pipeline", () => {
       const embedder: Embedder = {
         model: base.model,
         dimensions: base.dimensions,
+        modalities: base.modalities,
         async embed(inputs) {
           seen.push(...inputs);
           return base.embed(inputs);
@@ -197,6 +198,7 @@ describe("direct media embedding pipeline", () => {
       const failing: Embedder = {
         model: base.model,
         dimensions: base.dimensions,
+        modalities: base.modalities,
         async embed(inputs) {
           if (inputs.some((input) => input.type === "multimodal")) throw new Error("503 embedding unavailable");
           return base.embed(inputs);
@@ -212,6 +214,64 @@ describe("direct media embedding pipeline", () => {
       await new Indexer(store, base, options).runOnce();
       expect((await store.getMediaAsset(9002, 1))?.embeddingStatus).toBe("done");
       expect(downloads).toBe(1);
+    } finally {
+      await db.close();
+    }
+  }, 30_000);
+
+  it("archives media the model cannot embed, skips only its vector and still indexes the post text", async () => {
+    const { db, store } = await freshStore();
+    try {
+      await store.upsertChannel({ id: 9004, ref: "@modal", username: "modal", title: "Модальности", about: null, accessHash: "1" });
+      await store.upsertPosts([
+        normalizeMessage(9004, message(1, "Фото кота", { media: mediaFor("photo", 2, "image/png", 0, "photo.png") })),
+        normalizeMessage(9004, message(2, "Голос про борщ", { media: mediaFor("voice", 1, "audio/ogg", 2.4, "voice.ogg") })),
+        normalizeMessage(9004, message(3, "Видео про хлеб", { media: mediaFor("video", 3, "video/mp4", 2.5, "video.mp4") })),
+        normalizeMessage(9004, message(4, "Анимация про чай", { media: mediaFor("gif", 5, "image/gif", 1.8, "animated.gif") })),
+      ]);
+      const { storage, objects } = makeStorage();
+      const seen: EmbeddingInput[] = [];
+      const base = fakeEmbedder(["image", "audio"]);
+      const embedder: Embedder = {
+        model: base.model,
+        dimensions: base.dimensions,
+        modalities: base.modalities,
+        async embed(inputs) {
+          seen.push(...inputs);
+          return base.embed(inputs);
+        },
+      };
+      const byMessage: Record<number, number> = { 1: 2, 2: 1, 3: 3, 4: 5 };
+      const indexer = new Indexer(store, embedder, indexerOptions(storage, async (id) => files[byMessage[id]!]!));
+
+      expect(await indexer.runOnce()).toBe(4);
+      expect(await store.indexStats()).toMatchObject({ posts: 4, indexed: 4, pending: 0, failed: 0 });
+
+      for (const messageId of [1, 2]) {
+        expect(await store.getMediaAsset(9004, messageId)).toMatchObject({ storageStatus: "stored", embeddingStatus: "done" });
+      }
+      for (const [messageId, original] of [[3, video], [4, gif]] as const) {
+        const asset = await store.getMediaAsset(9004, messageId);
+        expect(asset).toMatchObject({ storageStatus: "stored", embeddingStatus: "skipped" });
+        expect(asset?.embeddingError).toMatch(/не принимает video/);
+        expect(objects.get(asset!.objectKey!)?.bytes).toEqual(original);
+      }
+
+      const rows = await db.query<{ messageId: number; kind: string }>(
+        `SELECT message_id AS "messageId", kind FROM chunks ORDER BY message_id, chunk_index`,
+      );
+      expect(rows.filter((row) => row.kind === "video")).toEqual([]);
+      for (const messageId of [1, 2, 3, 4]) {
+        expect(rows.some((row) => row.messageId === messageId && row.kind === "text")).toBe(true);
+      }
+      expect(seen.some((input) => input.type === "multimodal" && input.parts.some((part) => part.type === "video"))).toBe(false);
+
+      const post = await store.getPost(9004, 3);
+      const mediaMap = await presentPostMedia([post!], store, storage);
+      expect(mediaMap.get("9004:3")).toMatchObject({
+        url: expect.stringMatching(/^https:\/\/objects\.example\.test\/sha256\//),
+        storage_status: "stored",
+      });
     } finally {
       await db.close();
     }

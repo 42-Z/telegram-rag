@@ -56,8 +56,8 @@ dev) — нужен Pro или отдельная организация.
 
 #### S3-compatible object storage
 
-Если `MEDIA_TYPES` не пуст, нужен приватный S3-compatible bucket с доступом на
-чтение и запись. Укажите `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`,
+Нужен приватный S3-compatible bucket с доступом на чтение и запись; без него
+сервис не запустится. Укажите `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`,
 `S3_ACCESS_KEY_ID` и `S3_SECRET_ACCESS_KEY`. `S3_ENDPOINT` должен быть
 доступен и контейнеру, и клиентским агентам: сервис выдаёт подписанную ссылку
 напрямую на объект, не проксируя скачивание. Для Neon Object Storage включите
@@ -87,8 +87,13 @@ TELEGRAM_API_ID=
 TELEGRAM_API_HASH=
 TELEGRAM_SESSION=
 TELEGRAM_CHANNELS=
+# Multimodal embeddings: set exactly one of OPENROUTER_API_KEY (OpenRouter) or
+# EMBEDDING_BASE_URL (Ollama, with EMBEDDING_MODEL and EMBEDDING_DIMENSIONS).
 OPENROUTER_API_KEY=
-# Private S3-compatible storage (required when MEDIA_TYPES is non-empty).
+# EMBEDDING_BASE_URL=http://ollama:11434
+# EMBEDDING_MODEL=embeddinggemma-2
+# EMBEDDING_DIMENSIONS=768
+# Private S3-compatible storage (required).
 S3_ENDPOINT=
 S3_REGION=
 S3_BUCKET=
@@ -98,7 +103,6 @@ S3_SECRET_ACCESS_KEY=
 # S3_CREDENTIALS_EXPIRES_AT=    # required with S3_SESSION_TOKEN; ISO 8601
 S3_FORCE_PATH_STYLE=true
 S3_URL_TTL_SECONDS=3600
-MEDIA_TYPES=photo,voice,video_note,audio,video,gif
 MEDIA_SINCE=
 MEDIA_MAX_MB=20
 MEDIA_MAX_SECONDS=1800

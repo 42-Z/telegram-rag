@@ -6,7 +6,7 @@
 import type { Embedder, EmbeddingInput } from "./embeddings.ts";
 import { chunkHeader, buildChunks } from "./chunks.ts";
 import { logger } from "./log.ts";
-import { inspectMedia, mediaFileName, prepareMediaChunks, sniffMimeType } from "./media/prepare.ts";
+import { inspectMedia, mediaFileName, mediaModality, prepareMediaChunks, sniffMimeType } from "./media/prepare.ts";
 import { type MediaProbe } from "./media/ffmpeg.ts";
 import type { PreparedMediaChunk } from "./media/prepare.ts";
 import type { ObjectStorage } from "./storage.ts";
@@ -51,10 +51,10 @@ export class Indexer {
   private timer: NodeJS.Timeout | undefined;
   private loopPromise: Promise<void> | undefined;
   private readonly store: Store;
-  private readonly embedder: Embedder | undefined;
+  private readonly embedder: Embedder;
   private readonly options: IndexerOptions;
 
-  constructor(store: Store, embedder: Embedder | undefined, options: IndexerOptions) {
+  constructor(store: Store, embedder: Embedder, options: IndexerOptions) {
     this.store = store;
     this.embedder = embedder;
     this.options = options;
@@ -62,8 +62,6 @@ export class Indexer {
 
   /** Один проход по очереди. Ошибка одного сообщения не останавливает соседние. */
   async runOnce(): Promise<number> {
-    if (!this.embedder) return this.archivePendingMedia();
-
     const posts = await this.store.pendingForEmbedding(this.options.batchSize, this.options.mediaTypes);
     if (posts.length === 0) return 0;
 
@@ -83,21 +81,6 @@ export class Indexer {
     });
     await Promise.all(workers);
     return posts.length;
-  }
-
-  private async archivePendingMedia(): Promise<number> {
-    if (!this.options.storage || !this.options.downloadMedia || this.options.mediaTypes.length === 0) return 0;
-    const jobs = await this.store.pendingMedia(this.options.mediaTypes, undefined, this.options.batchSize);
-    for (const job of jobs) {
-      if (this.stopped) break;
-      try {
-        await this.saveOriginal(job);
-      } catch (error) {
-        await this.store.markMediaStorageFailed(assetRef(job), String(error));
-        log.warn(`не сохранён оригинал ${job.channelId}/${job.messageId}`, error);
-      }
-    }
-    return jobs.length;
   }
 
   private async saveOriginal(job: MediaJob): Promise<SavedOriginal | undefined> {
@@ -204,14 +187,18 @@ export class Indexer {
       await this.store.markMediaEmbeddingSkipped(assetRef(mediaJob), mediaSkipReason);
     }
     if (original && mediaJob && !mediaSkipReason) {
+      const modality = mediaModality(mediaJob.media.type);
       const tooOld = this.options.mediaSince && new Date(post.date) < this.options.mediaSince;
       const tooLong = (original.info?.duration ?? media?.duration ?? 0) > this.options.maxMediaSeconds;
-      if (tooOld || tooLong) {
-        mediaSkipReason = tooOld
-          ? `дата раньше MEDIA_SINCE (${this.options.mediaSince!.toISOString()})`
-          : `длительность больше MEDIA_MAX_SECONDS (${this.options.maxMediaSeconds})`;
-        await this.store.markMediaEmbeddingSkipped(assetRef(mediaJob), mediaSkipReason);
+      if (!modality || !this.embedder.modalities.has(modality)) {
+        // Оригинал уже в S3 и отдаётся вместе с постом; вектора у такого вложения нет.
+        mediaSkipReason = `модель ${this.embedder.model} не принимает ${modality ?? mediaJob.media.type}`;
+      } else if (tooOld) {
+        mediaSkipReason = `дата раньше MEDIA_SINCE (${this.options.mediaSince!.toISOString()})`;
+      } else if (tooLong) {
+        mediaSkipReason = `длительность больше MEDIA_MAX_SECONDS (${this.options.maxMediaSeconds})`;
       }
+      if (mediaSkipReason) await this.store.markMediaEmbeddingSkipped(assetRef(mediaJob), mediaSkipReason);
     }
 
     const text = searchableText(post);
@@ -226,7 +213,7 @@ export class Indexer {
     }>;
 
     if (textChunks.length > 0) {
-      const vectors = await this.embedder!.embed(textChunks.map(asDocument));
+      const vectors = await this.embedder.embed(textChunks.map(asDocument));
       if (vectors.length !== textChunks.length) throw new Error("Embedding endpoint returned an unexpected number of text vectors");
       textChunks.forEach((content, index) => chunks.push({ kind: "text", content, embedding: vectors[index]! }));
     }

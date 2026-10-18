@@ -659,21 +659,6 @@ export class Store {
 
   // ── медиа ───────────────────────────────────────────────────────────────
 
-   /** Посты, оригиналы вложений которых ещё не сохранены в S3; сначала новые. */
-  async pendingMedia(types: readonly string[], since: Date | undefined, limit: number): Promise<MediaJob[]> {
-    if (types.length === 0) return [];
-    return this.db.query<MediaJob>(
-      `SELECT p.channel_id AS "channelId", p.message_id AS "messageId", p.date, p.text, p.media
-       FROM posts p JOIN channels c ON c.id = p.channel_id
-       LEFT JOIN media_assets a ON a.channel_id = p.channel_id AND a.message_id = p.message_id
-       WHERE p.media IS NOT NULL AND NOT p.deleted AND c.enabled
-         AND (a.asset_id IS NULL OR a.storage_status = 'pending')
-         AND p.media->>'type' = ANY($1::text[]) AND ($2::timestamptz IS NULL OR p.date >= $2)
-       ORDER BY p.date DESC LIMIT $3`,
-      [types, since ?? null, limit],
-    );
-  }
-
   async markMediaEmbeddingSkipped(
     post: MediaAssetReference,
     reason: string,

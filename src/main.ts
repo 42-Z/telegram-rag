@@ -3,11 +3,12 @@
 import { serve } from "@hono/node-server";
 import { loadConfig } from "./config.ts";
 import { explainConnectionError, migrate, openDb } from "./db.ts";
-import { createEmbedder, type Embedder } from "./embeddings.ts";
+import { createEmbedder } from "./embeddings.ts";
 import { createApp } from "./http.ts";
 import { Indexer } from "./indexer.ts";
 import { logger, setLogLevel } from "./log.ts";
-import { createObjectStorage, type ObjectStorage } from "./storage.ts";
+import { MEDIA_TYPES, mediaModality } from "./media/prepare.ts";
+import { createObjectStorage } from "./storage.ts";
 import { Store } from "./store.ts";
 import { createClient } from "./telegram/client.ts";
 import { Ingestor } from "./telegram/ingest.ts";
@@ -20,11 +21,12 @@ let db: Awaited<ReturnType<typeof openDb>>;
 try {
   db = await openDb(config.DATABASE_URL, { caCert: config.DATABASE_CA_CERT, poolSize: config.DATABASE_POOL_SIZE });
   await migrate(db, {
-    model: config.EMBEDDING_MODEL,
-    dimensions: config.EMBEDDING_DIMENSIONS,
+    model: config.embedding.model,
+    dimensions: config.embedding.dimensions,
     profile: JSON.stringify({
       pipeline: "source-multimodal-v1",
-      mediaTypes: [...config.MEDIA_TYPES].sort(),
+      modalities: [...config.embedding.modalities].sort(),
+      mediaTypes: [...MEDIA_TYPES].sort(),
       mediaSince: config.MEDIA_SINCE ?? null,
       segmentSeconds: config.MEDIA_SEGMENT_SECONDS,
       segmentOverlapSeconds: config.MEDIA_SEGMENT_OVERLAP_SECONDS,
@@ -39,39 +41,34 @@ try {
 }
 
 const store = new Store(db);
-let storage: ObjectStorage | undefined;
-if (config.S3_REGION && config.S3_BUCKET && config.S3_ACCESS_KEY_ID && config.S3_SECRET_ACCESS_KEY) {
-  storage = createObjectStorage({
-    endpoint: config.S3_ENDPOINT,
-    region: config.S3_REGION,
-    bucket: config.S3_BUCKET,
-    credentials: {
-      accessKeyId: config.S3_ACCESS_KEY_ID,
-      secretAccessKey: config.S3_SECRET_ACCESS_KEY,
-      ...(config.S3_SESSION_TOKEN ? { sessionToken: config.S3_SESSION_TOKEN } : {}),
-      ...(config.S3_CREDENTIALS_EXPIRES_AT
-        ? { expiration: new Date(config.S3_CREDENTIALS_EXPIRES_AT) }
-        : {}),
-    },
-    forcePathStyle: config.S3_FORCE_PATH_STYLE,
-    urlTtlSeconds: config.S3_URL_TTL_SECONDS,
-  });
-}
+// Конфиг гарантирует, что S3 настроен: оригиналы медиа хранятся только там.
+const storage = createObjectStorage({
+  endpoint: config.S3_ENDPOINT,
+  region: config.S3_REGION!,
+  bucket: config.S3_BUCKET!,
+  credentials: {
+    accessKeyId: config.S3_ACCESS_KEY_ID!,
+    secretAccessKey: config.S3_SECRET_ACCESS_KEY!,
+    ...(config.S3_SESSION_TOKEN ? { sessionToken: config.S3_SESSION_TOKEN } : {}),
+    ...(config.S3_CREDENTIALS_EXPIRES_AT
+      ? { expiration: new Date(config.S3_CREDENTIALS_EXPIRES_AT) }
+      : {}),
+  },
+  forcePathStyle: config.S3_FORCE_PATH_STYLE,
+  urlTtlSeconds: config.S3_URL_TTL_SECONDS,
+});
 
-let embedder: Embedder | undefined;
-const localEmbeddings = !/openrouter\.ai|api\.openai\.com/.test(config.EMBEDDING_BASE_URL);
-if (config.EMBEDDING_API_KEY || localEmbeddings) {
-  embedder = createEmbedder({
-    baseURL: config.EMBEDDING_BASE_URL,
-    apiKey: config.EMBEDDING_API_KEY,
-    model: config.EMBEDDING_MODEL,
-    dimensions: config.EMBEDDING_DIMENSIONS,
-    sendDimensions: config.EMBEDDING_SEND_DIMENSIONS,
-    maxRequestBytes: config.EMBEDDING_MAX_REQUEST_MB * 1_048_576,
-  });
-  log.info(`эмбеддинги: ${config.EMBEDDING_MODEL} (${config.EMBEDDING_DIMENSIONS}) через ${config.EMBEDDING_BASE_URL}`);
-} else {
-  log.warn("нет EMBEDDING_API_KEY/OPENROUTER_API_KEY: векторная индексация выключена");
+const embedder = createEmbedder(config.embedding);
+log.info(
+  `эмбеддинги (${config.embedding.api}): ${config.embedding.model} (${config.embedding.dimensions}) ` +
+    `через ${config.embedding.baseURL}; медиа: ${config.embedding.modalities.join(", ")}`,
+);
+const archiveOnly = MEDIA_TYPES.filter((type) => {
+  const modality = mediaModality(type);
+  return !modality || !embedder.modalities.has(modality);
+});
+if (archiveOnly.length > 0) {
+  log.info(`модель не принимает эти типы медиа — они сохраняются в S3 без векторов: ${archiveOnly.join(", ")}`);
 }
 
 let ingestor: Ingestor | undefined;
@@ -89,25 +86,23 @@ if (config.telegramEnabled) {
   });
 }
 
-if (embedder || (ingestor && storage && config.MEDIA_TYPES.length > 0)) {
-  const source = ingestor;
-  indexer = new Indexer(store, embedder, {
-    batchSize: config.EMBEDDING_BATCH_SIZE,
-    concurrency: config.MEDIA_CONCURRENCY,
-    mediaTypes: source && storage ? config.MEDIA_TYPES : [],
-    mediaSince: config.mediaSince,
-    maxMediaBytes: config.MEDIA_MAX_MB * 1_048_576,
-    maxMediaSeconds: config.MEDIA_MAX_SECONDS,
-    segmentSeconds: config.MEDIA_SEGMENT_SECONDS,
-    segmentOverlapSeconds: config.MEDIA_SEGMENT_OVERLAP_SECONDS,
-    storage,
-    ...(source
-      ? { downloadMedia: (channelId, messageId, expected) => source.downloadMedia(channelId, messageId, expected) }
-      : {}),
-  });
-  if (ingestor && storage && config.MEDIA_TYPES.length > 0) {
-    log.info(`единая очередь: оригиналы в S3 и эмбеддинги ${config.MEDIA_TYPES.join(", ")}`);
-  }
+const source = ingestor;
+indexer = new Indexer(store, embedder, {
+  batchSize: config.EMBEDDING_BATCH_SIZE,
+  concurrency: config.MEDIA_CONCURRENCY,
+  mediaTypes: source ? MEDIA_TYPES : [],
+  mediaSince: config.mediaSince,
+  maxMediaBytes: config.MEDIA_MAX_MB * 1_048_576,
+  maxMediaSeconds: config.MEDIA_MAX_SECONDS,
+  segmentSeconds: config.MEDIA_SEGMENT_SECONDS,
+  segmentOverlapSeconds: config.MEDIA_SEGMENT_OVERLAP_SECONDS,
+  storage,
+  ...(source
+    ? { downloadMedia: (channelId, messageId, expected) => source.downloadMedia(channelId, messageId, expected) }
+    : {}),
+});
+if (source) {
+  log.info(`единая очередь: оригиналы всех типов в S3, векторы для ${config.embedding.modalities.join(", ")}`);
 }
 
 if (ingestor) {
@@ -121,8 +116,8 @@ if (ingestor) {
 }
 
 const app = createApp({
-  context: { store, embedder, storage, mediaTypes: config.MEDIA_TYPES },
-  mediaTypes: config.MEDIA_TYPES,
+  context: { store, embedder, storage, mediaTypes: MEDIA_TYPES },
+  mediaTypes: MEDIA_TYPES,
   ingestor,
   apiToken: config.API_TOKEN,
   adminToken: config.ADMIN_TOKEN,
@@ -141,7 +136,7 @@ async function shutdown(signal: string) {
   server.close();
   await indexer?.stop().catch(() => {});
   await ingestor?.stop().catch(() => {});
-  await storage?.close().catch(() => {});
+  await storage.close().catch(() => {});
   await db.close().catch(() => {});
   process.exit(0);
 }

@@ -4,12 +4,14 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { createEmbedder, type EmbedderConfig } from "../src/embeddings.ts";
 
 interface RequestRecord {
+  path: string;
   body: Record<string, unknown>;
   authorization: string | undefined;
 }
 
 const requests: RequestRecord[] = [];
 let server: Server;
+let origin: string;
 let endpoint: string;
 let status = 200;
 let statusQueue: number[] = [];
@@ -23,7 +25,7 @@ async function readBody(request: IncomingMessage): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-function respond(response: ServerResponse, body: string, currentStatus: number): void {
+function respond(response: ServerResponse, body: string, currentStatus: number, path: string): void {
   const currentRetryAfter = retryAfter;
   if (currentStatus !== 200) {
     response.writeHead(currentStatus, {
@@ -38,7 +40,10 @@ function respond(response: ServerResponse, body: string, currentStatus: number):
   const vectors = input.map((_, index) => ({ index, embedding: [index + 0.1, 0.2, 0.3] }));
   if (invalidResponse) vectors[0] = { index: 0, embedding: [0.1, null, 0.3] } as never;
   response.writeHead(200, { "content-type": "application/json" });
-  response.end(JSON.stringify({ data: vectors }));
+  // Ollama отвечает массивом `embeddings` в порядке входов, OpenRouter — `data` с индексами.
+  response.end(JSON.stringify(path.endsWith("/api/embed")
+    ? { embeddings: vectors.map((vector) => vector.embedding) }
+    : { data: vectors }));
 }
 
 beforeAll(async () => {
@@ -51,15 +56,17 @@ beforeAll(async () => {
       response.writeHead(400).end();
       return;
     }
-    requests.push({ body, authorization: request.headers.authorization });
+    const path = request.url ?? "";
+    requests.push({ path, body, authorization: request.headers.authorization });
     if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
-    respond(response, raw, statusQueue.shift() ?? status);
+    respond(response, raw, statusQueue.shift() ?? status, path);
   });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(0, "127.0.0.1", resolve);
   });
-  endpoint = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+  origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  endpoint = `${origin}/v1`;
 });
 
 afterEach(() => {
@@ -78,11 +85,25 @@ afterAll(async () => {
 
 function makeEmbedder(overrides: Partial<EmbedderConfig> = {}) {
   return createEmbedder({
+    api: "openrouter",
     baseURL: endpoint,
     apiKey: "local-test-key",
     model: "google/gemini-embedding-2",
     dimensions: 3,
     sendDimensions: true,
+    modalities: ["image", "audio", "video"],
+    ...overrides,
+  });
+}
+
+/** Ollama: базовый адрес без `/v1`, ключ не нужен, видео не принимается. */
+function makeOllamaEmbedder(overrides: Partial<EmbedderConfig> = {}) {
+  return makeEmbedder({
+    api: "ollama",
+    baseURL: origin,
+    apiKey: undefined,
+    model: "embeddinggemma-2",
+    modalities: ["image", "audio"],
     ...overrides,
   });
 }
@@ -97,6 +118,7 @@ describe("multimodal embedding requests", () => {
 
     expect(vectors).toEqual([[0.1, 0.2, 0.3], [1.1, 0.2, 0.3]]);
     expect(requests).toHaveLength(1);
+    expect(requests[0]?.path).toBe("/v1/embeddings");
     expect(requests[0]?.authorization).toBe("Bearer local-test-key");
     expect(requests[0]?.body).toMatchObject({
       model: "google/gemini-embedding-2",
@@ -180,5 +202,73 @@ describe("multimodal embedding requests", () => {
       }]),
     ).rejects.toThrow(/One embedding input exceeds/);
     expect(requests).toHaveLength(0);
+  });
+
+  it("exposes the modalities the model accepts", () => {
+    expect([...makeEmbedder().modalities].sort()).toEqual(["audio", "image", "video"]);
+    expect([...makeOllamaEmbedder().modalities].sort()).toEqual(["audio", "image"]);
+  });
+});
+
+describe("Ollama embedding requests", () => {
+  it("sends strings for text and {text, image, audio} objects for media to /api/embed", async () => {
+    const embedder = makeOllamaEmbedder();
+    const vectors = await embedder.embed([
+      { type: "text", purpose: "query", text: "кошка на окне" },
+      { type: "multimodal", parts: [
+        { type: "text", text: "подпись поста" },
+        { type: "image", mimeType: "image/png", data: Buffer.from("image-bytes") },
+      ] },
+      { type: "multimodal", parts: [
+        { type: "text", text: "" },
+        { type: "audio", mimeType: "audio/wav", data: Buffer.from("audio-bytes") },
+      ] },
+    ]);
+
+    expect(vectors).toHaveLength(3);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.path).toBe("/api/embed");
+    expect(requests[0]?.authorization).toBeUndefined();
+    expect(requests[0]?.body).toEqual({
+      model: "embeddinggemma-2",
+      input: [
+        "task: search result | query: кошка на окне",
+        { text: "подпись поста", image: Buffer.from("image-bytes").toString("base64") },
+        { audio: Buffer.from("audio-bytes").toString("base64") },
+      ],
+      dimensions: 3,
+    });
+  });
+
+  it("sends the key only when one is configured and omits dimensions on request", async () => {
+    await makeOllamaEmbedder({ apiKey: "proxy-key", sendDimensions: false })
+      .embed([{ type: "text", purpose: "query", text: "query" }]);
+
+    expect(requests[0]?.authorization).toBe("Bearer proxy-key");
+    expect(requests[0]?.body).not.toHaveProperty("dimensions");
+  });
+
+  it("refuses video and repeated media before sending anything", async () => {
+    const embedder = makeOllamaEmbedder();
+    await expect(embedder.embed([{
+      type: "multimodal",
+      parts: [{ type: "video", mimeType: "video/mp4", data: Buffer.from("video-bytes") }],
+    }])).rejects.toThrow(/video/);
+    await expect(embedder.embed([{
+      type: "multimodal",
+      parts: [
+        { type: "image", mimeType: "image/png", data: Buffer.from("a") },
+        { type: "image", mimeType: "image/png", data: Buffer.from("b") },
+      ],
+    }])).rejects.toThrow(/at most one image/);
+    expect(requests).toHaveLength(0);
+  });
+
+  it("rejects wrong-sized vectors and server errors", async () => {
+    const input = [{ type: "text" as const, purpose: "query" as const, text: "query" }];
+    await expect(makeOllamaEmbedder({ dimensions: 2 }).embed(input)).rejects.toThrow(/dimensions/);
+
+    status = 501;
+    await expect(makeOllamaEmbedder().embed(input)).rejects.toThrow("HTTP 501");
   });
 });
