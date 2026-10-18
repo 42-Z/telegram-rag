@@ -1,19 +1,19 @@
-# Сборка образа на main, выкладка в GHCR, выкатка на VPS по SSH — как в Mimic42.
+# Выкатка на VPS: проверки (ci.yml) → образ в GHCR → SSH → deploy.sh с откатом
+# → проверка адреса снаружи. Запускается только вручную (Actions → Deploy →
+# Run workflow) и только из main. Автовыкатки на пуш нет: пока секреты и
+# окружение production не заведены, каждый merge заканчивался бы ошибкой.
 #
-# Настройка репозитория (один раз, мейнтейнером):
+# Настройка (один раз, Settings → Environments → production):
+# - Deployment branches: только main.
 # - Secrets: DEPLOY_SSH_KEY (ed25519 без пароля), DEPLOY_HOST, DEPLOY_USER,
 #   DEPLOY_KNOWN_HOSTS (вывод `ssh-keyscan`, отпечаток сверен с консолью VPS).
-# - Variables: DEPLOY_PATH (/root/sites/telegram-rag), DEPLOY_PORT (22),
-#   PUBLIC_URL (https://telegram-rag.zomb.top) — для проверки после выкатки.
+# - Variables: DEPLOY_PATH (/root/sites/telegram-rag), PUBLIC_URL
+#   (https://telegram-rag.zomb.top), DEPLOY_PORT (если не 22).
 # - Пакет ghcr.io/42-z/telegram-rag переключить в PUBLIC, чтобы сервер
 #   скачивал образ без docker login.
 
 name: Deploy
 
-# Бета: выкатка только вручную (Actions → Deploy → Run workflow), пока сервер
-# и секреты репозитория не настроены. Потом вернуть автозапуск:
-#   push:
-#     branches: [main]
 on:
   workflow_dispatch:
 
@@ -23,46 +23,62 @@ concurrency:
 
 permissions:
   contents: read
-  packages: write
 
 env:
   IMAGE: ghcr.io/42-z/telegram-rag
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+  guard:
+    name: Main only
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .node-version
-          cache: npm
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
-      - run: npm ci
-      - run: npm run typecheck
-      - run: npm test
+      - name: Require main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Выкатывать можно только main, запуск был из ${GITHUB_REF_NAME}"
+          exit 1
+
+  checks:
+    name: CI
+    needs: [guard]
+    uses: ./.github/workflows/ci.yml
 
   build:
-    runs-on: ubuntu-latest
-    needs: [test]
+    name: Build and push image
+    runs-on: ubuntu-24.04
+    needs: [checks]
     timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - id: meta
-        uses: docker/metadata-action@v5
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.IMAGE }}
           tags: |
             type=sha,format=long
-            type=raw,value=latest,enable={{is_default_branch}}
-      - uses: docker/build-push-action@v6
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           push: true
@@ -72,46 +88,67 @@ jobs:
           cache-to: type=gha,mode=max,scope=telegram-rag
 
   deploy:
-    runs-on: ubuntu-latest
+    name: Roll out to VPS
+    runs-on: ubuntu-24.04
     needs: [build]
     timeout-minutes: 15
-    environment: production
+    environment:
+      name: production
+      url: ${{ vars.PUBLIC_URL }}
+    env:
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+      DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
+      PUBLIC_URL: ${{ vars.PUBLIC_URL }}
     steps:
-      - uses: actions/checkout@v4
+      # Нужны только compose-файл и deploy.sh.
+      - name: Check out deploy files
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: deploy
+          persist-credentials: false
 
       - name: Set up SSH
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
         run: |
-          mkdir -p ~/.ssh
-          printf '%s\n' "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
-          chmod 600 ~/.ssh/known_hosts
-          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          for name in DEPLOY_HOST DEPLOY_USER DEPLOY_SSH_KEY DEPLOY_KNOWN_HOSTS DEPLOY_PATH PUBLIC_URL; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Не задан ${name} (Settings → Environments → production)"
+              exit 1
+            fi
+          done
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
+          cat > ~/.ssh/config <<EOF
+          Host production
+            HostName ${DEPLOY_HOST}
+            User ${DEPLOY_USER}
+            Port ${DEPLOY_PORT:-22}
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+          EOF
 
       - name: Copy compose files
-        run: |
-          scp -i ~/.ssh/deploy_key -P "${{ vars.DEPLOY_PORT }}" \
-            deploy/docker-compose.yml deploy/deploy.sh \
-            "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:${{ vars.DEPLOY_PATH }}/"
+        run: scp deploy/docker-compose.yml deploy/deploy.sh "production:${DEPLOY_PATH}/"
 
       - name: Roll out
+        env:
+          IMAGE_TAG: sha-${{ github.sha }}
         run: |
-          ssh -i ~/.ssh/deploy_key -p "${{ vars.DEPLOY_PORT }}" \
-            -o StrictHostKeyChecking=yes \
-            "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
-            "cd ${{ vars.DEPLOY_PATH }} && bash deploy.sh sha-${{ github.sha }}"
+          remote="cd $(printf '%q' "$DEPLOY_PATH") && bash deploy.sh $(printf '%q' "$IMAGE_TAG")"
+          # shellcheck disable=SC2029  # команду собирает клиент, значения экранированы выше
+          ssh production "$remote"
 
+      # deploy.sh уже дождался здоровья контейнера; здесь проверяется путь снаружи
+      # (DNS, Caddy, сертификат). /health Caddy наружу не отдаёт, поэтому адрес /.
       - name: Smoke test
-        run: |
-          set -e
-          code=""
-          for i in 1 2 3; do
-            code="$(curl -s -o /dev/null -w '%{http_code}' "${{ vars.PUBLIC_URL }}/")"
-            echo "GET / -> ${code} (attempt ${i})"
-            test "${code}" = "200" && break
-            sleep 10
-          done
-          test "${code}" = "200"
-
-      - name: Remove SSH key
-        if: always()
-        run: rm -f ~/.ssh/deploy_key
+        run: >
+          curl --fail --silent --show-error --output /dev/null
+          --max-time 10 --retry 5 --retry-delay 10 --retry-all-errors
+          "${PUBLIC_URL}/"
