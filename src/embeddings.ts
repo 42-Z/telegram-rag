@@ -64,8 +64,10 @@ function videoFormat(mimeType: string): string {
   throw new TypeError(`Unsupported video embedding MIME type: ${mimeType}`);
 }
 
-function toRequestInput(input: EmbeddingInput): string | { content: Array<Record<string, unknown>> } {
-  if (input.type === "text") return formatText(input);
+function toRequestInput(input: EmbeddingInput): { content: Array<Record<string, unknown>> } {
+  if (input.type === "text") {
+    return { content: [{ type: "text", text: formatText(input) }] };
+  }
   if (input.parts.length === 0) throw new TypeError("A multimodal embedding input needs at least one content part");
 
   return {

@@ -101,8 +101,8 @@ describe("multimodal embedding requests", () => {
     expect(requests[0]?.body).toMatchObject({
       model: "google/gemini-embedding-2",
       input: [
-        "task: search result | query: найди рецепт",
-        "title: Кухня | text: тесто для хлеба",
+        { content: [{ type: "text", text: "task: search result | query: найди рецепт" }] },
+        { content: [{ type: "text", text: "title: Кухня | text: тесто для хлеба" }] },
       ],
       dimensions: 3,
       encoding_format: "float",
