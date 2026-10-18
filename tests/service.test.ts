@@ -5,17 +5,41 @@
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { migrate } from "../src/db.ts";
 import { createApp } from "../src/http.ts";
 import { Indexer } from "../src/indexer.ts";
-import { normalizeMessage } from "../src/telegram/normalize.ts";
+import type { ObjectStorage, SaveOriginalInput, StoredOriginal } from "../src/storage.ts";
+import { mediaSourceFingerprint, normalizeMessage } from "../src/telegram/normalize.ts";
 import { DIMENSIONS, fakeEmbedder, freshStore, message, seed } from "./helpers.ts";
 
 const { db, store } = await freshStore();
 const embedder = fakeEmbedder();
-const indexer = new Indexer(store, embedder, 64);
-const app = createApp({ context: { store, embedder }, apiToken: "secret", publicUrl: "http://test" });
+let signedCount = 0;
+const storage: ObjectStorage = {
+  bucket: "test-media",
+  async saveOriginal(input: SaveOriginalInput): Promise<StoredOriginal> {
+    const sha256 = createHash("sha256").update(input.bytes).digest("hex");
+    return { key: `sha256/${sha256}`, sha256, size: input.bytes.byteLength, contentType: input.contentType };
+  },
+  async readOriginal() { return Buffer.from("photo-original"); },
+  async signGet(key) {
+    signedCount += 1;
+    return { url: `https://objects.example.test/${key}?signature=${signedCount}`, expiresIn: 3600, expiresAt: new Date(Date.now() + 3_600_000) };
+  },
+  async close() {},
+};
+const indexer = new Indexer(store, embedder, {
+  batchSize: 64,
+  concurrency: 1,
+  mediaTypes: [],
+  maxMediaBytes: 20 * 1_048_576,
+  maxMediaSeconds: 1800,
+  segmentSeconds: 60,
+  segmentOverlapSeconds: 5,
+});
+const app = createApp({ context: { store, embedder, storage }, apiToken: "secret", publicUrl: "http://test" });
 
 const call = (path: string, init: RequestInit = {}) =>
   app.request(path, { ...init, headers: { authorization: "Bearer secret", "content-type": "application/json", ...init.headers } });
@@ -27,6 +51,23 @@ const tool = async (name: string, args: unknown) => {
 beforeAll(async () => {
   await seed(store);
   while ((await indexer.runOnce()) > 0);
+  const bytes = Buffer.from("photo-original");
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  const photoPost = await store.getPost(1001, 3);
+  await store.saveMediaAssetFile({
+    channelId: 1001,
+    messageId: 3,
+    sourceFileId: undefined,
+    sourceFingerprint: mediaSourceFingerprint(photoPost?.media),
+  }, {
+    bucket: storage.bucket,
+    objectKey: `sha256/${sha256}`,
+    sha256,
+    mimeType: "image/png",
+    fileName: "album.png",
+    size: bytes.byteLength,
+  });
+  await db.query("UPDATE media_assets SET embedding_status = 'done' WHERE channel_id = 1001 AND message_id = 3");
 });
 afterAll(() => db.close());
 
@@ -110,6 +151,16 @@ describe("REST", () => {
     expect(body.album).toHaveLength(2);
     expect(body.before).toHaveLength(1);
     expect(body.before[0].message_id).toBe(2);
+    expect(body.media).toMatchObject({
+      file_name: "album.png",
+      mime_type: "image/png",
+      storage_status: "stored",
+    });
+    expect(body.media.url).toMatch(/^https:\/\/objects\.example\.test\//);
+    expect(body.album[1].media.url).toBeUndefined();
+
+    const again = await tool("get_post", { link: "https://t.me/tech/3" });
+    expect(again.body.media.url).not.toBe(body.media.url);
 
     const missing = await tool("get_post", { channel: "tech", message_id: 999 });
     expect(missing.status).toBe(400);
@@ -163,6 +214,14 @@ describe("подключение любых моделей", () => {
     const result = (await client.callTool({ name: "search_posts", arguments: { query: "хлеб на закваске", limit: 2 } })) as any;
     const payload = JSON.parse(result.content[0].text);
     expect(payload.results[0].link).toBe("https://t.me/food/2");
+    expect(result.structuredContent.results[0].message_id).toBe(2);
+
+    const media = (await client.callTool({ name: "get_post", arguments: { link: "https://t.me/tech/3" } })) as any;
+    const mediaPayload = JSON.parse(media.content[0].text);
+    const resource = media.content.find((block: any) => block.type === "resource_link");
+    expect(resource.uri).toBe(mediaPayload.media.url);
+    expect(resource.uri).toMatch(/^https:\/\/objects\.example\.test\//);
+    expect(media.structuredContent.media.url).toBe(resource.uri);
 
     const error = (await client.callTool({ name: "get_post", arguments: { link: "мусор" } })) as any;
     expect(error.isError).toBe(true);
@@ -172,7 +231,7 @@ describe("подключение любых моделей", () => {
 
 describe("без эмбеддингов", () => {
   it("поиск откатывается на слова и говорит об этом", async () => {
-    const bare = createApp({ context: { store, embedder: undefined } });
+    const bare = createApp({ context: { store, embedder: undefined, storage } });
     const response = await bare.request("/api/tools/search_posts", {
       method: "POST",
       headers: { "content-type": "application/json" },

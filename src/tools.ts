@@ -11,6 +11,8 @@
 import { z } from "zod";
 import type { Embedder } from "./embeddings.ts";
 import { logger } from "./log.ts";
+import { postKey, presentPost, presentPostMedia } from "./presentation.ts";
+import type { ObjectStorage } from "./storage.ts";
 import type { Post, PostFilter, SearchHit, Store } from "./store.ts";
 
 const log = logger("tools");
@@ -18,6 +20,8 @@ const log = logger("tools");
 export interface ToolContext {
   store: Store;
   embedder: Embedder | undefined;
+  storage?: ObjectStorage;
+  mediaTypes?: readonly string[];
 }
 
 export interface ToolDef<S extends z.ZodObject = z.ZodObject> {
@@ -67,42 +71,6 @@ async function buildFilter(
 
 const iso = (date: Date | string | null | undefined) => (date ? new Date(date).toISOString() : undefined);
 
-/** Пост в виде для модели: без пустых полей, с понятными именами. */
-export function presentPost(post: Post, extra: Record<string, unknown> = {}) {
-  const view = {
-    channel: post.channel,
-    channel_username: post.channelUsername ?? undefined,
-    channel_id: post.channelId,
-    message_id: post.messageId,
-    link: post.link,
-    date: iso(post.date),
-    edited: iso(post.editDate),
-    author: post.postAuthor ?? undefined,
-    text: post.text,
-    media: post.media
-      ? {
-          ...post.media,
-          searchText: undefined,
-          fileId: undefined,
-          // что модель увидела и услышала в медиа — как текст
-          transcript: post.mediaAnalysis?.transcript,
-          description: post.mediaAnalysis?.description,
-          text_on_image: post.mediaAnalysis?.textOnImage,
-          analysis: post.mediaStatus === "done" ? undefined : (post.mediaAnalysis?.note ?? post.mediaStatus ?? undefined),
-        }
-      : undefined,
-    views: post.views ?? undefined,
-    forwards: post.forwards ?? undefined,
-    comments: post.replies ?? undefined,
-    reactions: post.reactions ?? undefined,
-    reply_to_message_id: post.replyTo ?? undefined,
-    forwarded_from: post.forwardedFrom ?? undefined,
-    deleted: post.deleted || undefined,
-    ...extra,
-  };
-  return JSON.parse(JSON.stringify(view));
-}
-
 /**
  * Альбом в Telegram — несколько сообщений с общим grouped_id, подпись
  * обычно у одного из них. В ленте альбом показывается одним постом.
@@ -129,11 +97,11 @@ export function collapseAlbums(posts: readonly Post[]): Array<Post & { album?: P
   return result;
 }
 
-function presentAlbumAware(post: Post & { album?: Post[] }) {
-  if (!post.album || post.album.length < 2) return presentPost(post);
+function presentAlbumAware(post: Post & { album?: Post[] }, media: Map<string, Record<string, unknown> | undefined>) {
+  if (!post.album || post.album.length < 2) return presentPost(post, media.get(postKey(post)));
   const items = [...post.album].sort((a, b) => a.messageId - b.messageId);
-  return presentPost(post, {
-    album: items.map((item) => ({ message_id: item.messageId, link: item.link, media: item.media?.type })),
+  return presentPost(post, media.get(postKey(post)), {
+    album: items.map((item) => presentPost(item, media.get(postKey(item)))),
   });
 }
 
@@ -146,6 +114,7 @@ export function fuseRankings(lists: ReadonlyArray<readonly SearchHit[]>, limit: 
       const entry = merged.get(key) ?? { ...hit, fused: 0 };
       entry.fused += 1 / (k + rank + 1);
       entry.matched ??= hit.matched;
+      entry.match ??= hit.match;
       merged.set(key, entry);
     });
   }
@@ -165,8 +134,8 @@ export const TOOLS: ToolDef[] = [
       "Список Telegram-каналов, за которыми следит сервис: название, @имя, описание, сколько постов сохранено и " +
       "проиндексировано, дата первого и последнего поста. Начни с этого, чтобы понять, какие знания доступны.",
     input: z.object({}),
-    async run(_args, { store }) {
-      const channels = await store.channelStats();
+    async run(_args, { store, mediaTypes }) {
+      const channels = await store.channelStats(mediaTypes ?? []);
       return {
         channels: channels.map((channel) => ({
           id: channel.id,
@@ -189,9 +158,9 @@ export const TOOLS: ToolDef[] = [
     name: "search_posts",
     title: "Поиск по постам",
     description:
-      "Поиск постов по смыслу и по словам одновременно (гибридный). Ищет и по тексту, и по содержимому медиа: " +
-      "расшифровкам голосовых и кружков, описаниям фото, тексту на картинках. Возвращает посты целиком: текст, медиа, " +
-      "дату, ссылку, реакции. Формулируй запрос обычными словами — синонимы и перефразы находятся. Для точных " +
+      "Поиск по исходному тексту, изображениям, аудио и видео через прямые эмбеддинги. Возвращает текст поста, " +
+      "метаданные вложений, прямые временные ссылки на сохранённые оригиналы и ссылки на Telegram-посты. " +
+      "Формулируй запрос обычными словами — синонимы и перефразы находятся. Для точных " +
       "имён, чисел и терминов можно mode=keyword, для абстрактных тем — mode=semantic.",
     input: z.object({
       query: z.string().min(1).describe("Что ищем, обычными словами"),
@@ -204,7 +173,7 @@ export const TOOLS: ToolDef[] = [
         .optional()
         .describe("hybrid (по умолчанию) — смысл + слова; semantic — только смысл; keyword — только слова"),
     }),
-    async run(args, { store, embedder }) {
+    async run(args, { store, embedder, storage }) {
       const limit = args.limit ?? 10;
       const filter = await buildFilter(store, args);
       let mode = args.mode ?? "hybrid";
@@ -217,7 +186,7 @@ export const TOOLS: ToolDef[] = [
           mode = "keyword";
         } else {
           try {
-            const [vector] = await embedder.embed([args.query]);
+            const [vector] = await embedder.embed([{ type: "text", purpose: "query", text: args.query }]);
             semantic = await store.semanticSearch(vector!, filter, mode === "hybrid" ? limit * 2 : limit);
           } catch (error) {
             log.warn("поиск по смыслу не удался", error);
@@ -229,11 +198,38 @@ export const TOOLS: ToolDef[] = [
       const keyword = mode !== "semantic" ? await store.keywordSearch(args.query, filter, mode === "hybrid" ? limit * 2 : limit) : [];
       const hits = mode === "hybrid" ? fuseRankings([semantic, keyword], limit) : (mode === "semantic" ? semantic : keyword).slice(0, limit);
 
+      const albums = new Map<string, Post[]>();
+      for (const hit of hits) {
+        const post = hit.post;
+        const key = post.groupedId ? `${post.channelId}:${post.groupedId}` : undefined;
+        if (key && !albums.has(key)) albums.set(key, await store.getAlbum(post.channelId, post.groupedId!));
+      }
+      const related = [...hits.map((hit) => hit.post), ...[...albums.values()].flat()];
+      const media = await presentPostMedia(related, store, storage);
       return {
         query: args.query,
         mode,
         notice,
-        results: hits.map((hit) => presentPost(hit.post, { score: Number(hit.score.toFixed(4)) })),
+        results: hits.map((hit) => {
+          const match = hit.match && hit.match.kind !== "text"
+            ? {
+                kind: hit.match.kind,
+                message_id: hit.post.messageId,
+                start_seconds: hit.match.startSeconds ?? undefined,
+                end_seconds: hit.match.endSeconds ?? undefined,
+              }
+            : undefined;
+          const album = hit.post.groupedId
+            ? albums.get(`${hit.post.channelId}:${hit.post.groupedId}`)
+            : undefined;
+          return presentPost(hit.post, media.get(postKey(hit.post)), {
+            score: Number(hit.score.toFixed(4)),
+            match,
+            ...(album && album.length > 1
+              ? { album: album.map((item) => presentPost(item, media.get(postKey(item)))) }
+              : {}),
+          });
+        }),
       };
     },
   }),
@@ -242,15 +238,15 @@ export const TOOLS: ToolDef[] = [
     name: "get_post",
     title: "Пост целиком",
     description:
-      "Один пост полностью по ссылке t.me/<канал>/<id> или по каналу и номеру сообщения: текст, медиа, все " +
-      "части альбома, пост, на который он отвечает, и соседние посты канала для контекста.",
+      "Один пост полностью по ссылке t.me/<канал>/<id> или по каналу и номеру сообщения: исходный текст, прямые " +
+      "ссылки на сохранённые вложения, все части альбома, пост, на который он отвечает, и соседние посты канала.",
     input: z.object({
       link: z.string().optional().describe("Ссылка вида https://t.me/<канал>/<id> или https://t.me/c/<id>/<id>"),
       channel: z.string().optional().describe("@имя, ссылка или id канала — если нет ссылки"),
       message_id: z.number().int().optional().describe("Номер сообщения в канале — если нет ссылки"),
       context: z.number().int().min(0).max(10).optional().describe("Сколько соседних постов до и после добавить, по умолчанию 0"),
     }),
-    async run(args, { store }) {
+    async run(args, { store, storage }) {
       let channelRef = args.channel;
       let messageId = args.message_id;
       if (args.link) {
@@ -267,24 +263,27 @@ export const TOOLS: ToolDef[] = [
 
       const album = post.groupedId ? await store.getAlbum(channel.id, post.groupedId) : [];
       const replyTo = post.replyTo ? await store.getPost(channel.id, post.replyTo) : undefined;
-      const extra: Record<string, unknown> = {};
-      if (album.length > 1) {
-        extra.album = album.map((item) => presentPost(item));
-        if (!post.text) extra.text = album.find((item) => item.text)?.text ?? "";
-      }
-      if (replyTo) extra.reply_to = presentPost(replyTo);
-
+      let before: Post[] = [];
+      let after: Post[] = [];
       if (args.context) {
         const around = async (order: "newest" | "oldest", bound: { from?: Date; to?: Date }) =>
           (await store.listPosts({ channelIds: [channel.id], ...bound, order, limit: args.context! + album.length + 1 })).posts
             .filter((item) => item.messageId !== post.messageId && !(post.groupedId && item.groupedId === post.groupedId))
             .slice(0, args.context);
-        const before = await around("newest", { to: new Date(post.date) });
-        const after = await around("oldest", { from: new Date(post.date) });
-        extra.before = before.reverse().map((item) => presentPost(item));
-        extra.after = after.map((item) => presentPost(item));
+        before = (await around("newest", { to: new Date(post.date) })).reverse();
+        after = await around("oldest", { from: new Date(post.date) });
       }
-      return presentPost(post, extra);
+      const allPosts = [post, ...album, ...(replyTo ? [replyTo] : []), ...before, ...after];
+      const media = await presentPostMedia(allPosts, store, storage);
+      const extra: Record<string, unknown> = {};
+      if (album.length > 1) {
+        extra.album = album.map((item) => presentPost(item, media.get(postKey(item))));
+        if (!post.text) extra.text = album.find((item) => item.text)?.text ?? "";
+      }
+      if (replyTo) extra.reply_to = presentPost(replyTo, media.get(postKey(replyTo)));
+      if (before.length > 0) extra.before = before.map((item) => presentPost(item, media.get(postKey(item))));
+      if (after.length > 0) extra.after = after.map((item) => presentPost(item, media.get(postKey(item))));
+      return presentPost(post, media.get(postKey(post)), extra);
     },
   }),
 
@@ -293,8 +292,7 @@ export const TOOLS: ToolDef[] = [
     title: "Лента постов",
     description:
       "Посты подряд по времени — как лента канала: за период, по каналам, от новых к старым или наоборот, с " +
-      "перелистыванием через offset. Для вопросов «что было на этой неделе», «последние посты», полного " +
-      "просмотра архива. Альбомы показаны одним постом.",
+      "перелистыванием через offset. Возвращает прямые ссылки на сохранённые медиа; альбомы показаны одним постом.",
     input: z.object({
       channels: channelsArg,
       date_from: dateFromArg,
@@ -303,16 +301,28 @@ export const TOOLS: ToolDef[] = [
       limit: z.number().int().min(1).max(100).optional().describe("Сколько постов, по умолчанию 20"),
       offset: z.number().int().min(0).optional().describe("Пропустить столько постов — для следующей страницы"),
     }),
-    async run(args, { store }) {
+    async run(args, { store, storage }) {
       const limit = args.limit ?? 20;
       const offset = args.offset ?? 0;
       const filter = await buildFilter(store, args);
       const { posts, total } = await store.listPosts({ ...filter, order: args.order ?? "newest", limit, offset });
+      const albums = new Map<string, Post[]>();
+      for (const post of posts) {
+        if (post.groupedId) {
+          const key = `${post.channelId}:${post.groupedId}`;
+          if (!albums.has(key)) albums.set(key, await store.getAlbum(post.channelId, post.groupedId));
+        }
+      }
+      const expanded = posts.flatMap((post) => post.groupedId ? albums.get(`${post.channelId}:${post.groupedId}`) ?? [post] : [post]);
+      const unique = [...new Map(expanded.map((post) => [postKey(post), post])).values()];
+      const collapsed = collapseAlbums(unique);
+      const allPosts = collapsed.flatMap((post) => post.album ?? [post]);
+      const media = await presentPostMedia(allPosts, store, storage);
       return {
         total,
         offset,
         next_offset: offset + posts.length < total ? offset + posts.length : undefined,
-        posts: collapseAlbums(posts).map(presentAlbumAware),
+        posts: collapsed.map((post) => presentAlbumAware(post, media)),
       };
     },
   }),

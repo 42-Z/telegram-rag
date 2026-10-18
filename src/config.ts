@@ -21,6 +21,8 @@ const list = z
       .filter(Boolean),
   );
 
+const SUPPORTED_MEDIA_TYPES = new Set(["photo", "voice", "video_note", "audio", "video", "gif"]);
+
 function isLoopbackHostname(hostname: string): boolean {
   const host = hostname.replace(/^\[|\]$/g, "").toLowerCase();
   if (host === "localhost" || host === "localhost." || host === "::1") return true;
@@ -33,9 +35,11 @@ const httpUrl = optional.pipe(
     .url()
     .refine((value) => {
       const url = new URL(value);
-      return url.protocol === "https:" || (url.protocol === "http:" && isLoopbackHostname(url.hostname));
+      const secureTransport = url.protocol === "https:" ||
+        (url.protocol === "http:" && isLoopbackHostname(url.hostname));
+      return secureTransport && !url.username && !url.password && !url.search && !url.hash;
     }, {
-      message: "S3_ENDPOINT must use HTTPS for non-loopback hosts",
+      message: "S3_ENDPOINT must use HTTPS for non-loopback hosts and must not contain credentials or query parameters",
     })
     .optional(),
 );
@@ -69,7 +73,7 @@ const schema = z.object({
   EMBEDDING_BASE_URL: z.string().default("https://openrouter.ai/api/v1"),
   EMBEDDING_API_KEY: optional,
   OPENROUTER_API_KEY: optional,
-  EMBEDDING_MODEL: z.string().default("google/gemini-embedding-001"),
+  EMBEDDING_MODEL: z.string().default("google/gemini-embedding-2"),
   /** Размер вектора. Смена модели или размера переиндексирует всё автоматически. */
   EMBEDDING_DIMENSIONS: z.coerce.number().int().min(1).max(4000).default(1536),
   /** Передавать ли `dimensions` в запрос: не все модели его понимают. */
@@ -78,24 +82,24 @@ const schema = z.object({
     .default("true")
     .transform((value) => value === "true"),
   EMBEDDING_BATCH_SIZE: z.coerce.number().int().min(1).max(512).default(64),
+  /** Верхняя граница сериализованного JSON-запроса с base64-медиа. */
+  EMBEDDING_MAX_REQUEST_MB: z.coerce.number().int().min(1).max(512).default(32),
 
   /**
-   * Медиа → текст: какие типы разбирать мультимодальной моделью. Пусто —
+   * Медиа: какие типы архивировать и индексировать мультимодальной моделью. Пусто —
    * выключено. Возможные: photo, voice, video_note, audio, video, gif.
    */
   MEDIA_TYPES: z
     .string()
-    .default("photo,voice,video_note")
+    .default("photo,voice,video_note,audio,video,gif")
     .transform((value) => value.split(/[,\s]+/).map((item) => item.trim()).filter(Boolean)),
-  /** Любой OpenAI-совместимый сервис с моделью, понимающей изображения и звук. */
-  MEDIA_BASE_URL: z.string().default("https://openrouter.ai/api/v1"),
-  MEDIA_API_KEY: optional,
-  MEDIA_MODEL: z.string().default("google/gemini-3.5-flash-lite"),
-  /** Разбирать медиа только постов не старше этой даты (ISO): история может стоить дорого. */
+  /** Архивировать все выбранные медиа; мультимодальные векторы строятся только после этой даты. */
   MEDIA_SINCE: optional,
   MEDIA_MAX_MB: z.coerce.number().positive().default(20),
   MEDIA_MAX_SECONDS: z.coerce.number().int().positive().default(1800),
   MEDIA_CONCURRENCY: z.coerce.number().int().min(1).max(16).default(2),
+  MEDIA_SEGMENT_SECONDS: z.coerce.number().int().min(1).max(120).default(60),
+  MEDIA_SEGMENT_OVERLAP_SECONDS: z.coerce.number().int().min(0).max(119).default(5),
 
   /** S3-compatible хранилище оригиналов медиа. Endpoint не нужен для AWS S3. */
   S3_ENDPOINT: httpUrl,
@@ -104,6 +108,11 @@ const schema = z.object({
   S3_ACCESS_KEY_ID: optional,
   S3_SECRET_ACCESS_KEY: optional,
   S3_SESSION_TOKEN: optional,
+  /** Expiry of static temporary S3 credentials; required together with S3_SESSION_TOKEN. */
+  S3_CREDENTIALS_EXPIRES_AT: optional.refine(
+    (value) => value === undefined || (Number.isFinite(Date.parse(value)) && Date.parse(value) > Date.now()),
+    { message: "S3_CREDENTIALS_EXPIRES_AT must be a future date/time" },
+  ),
   S3_FORCE_PATH_STYLE: z
     .enum(["true", "false"])
     .default("true")
@@ -117,6 +126,29 @@ const schema = z.object({
 
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
 }).superRefine((config, ctx) => {
+  const unsupportedTypes = config.MEDIA_TYPES.filter((type) => !SUPPORTED_MEDIA_TYPES.has(type));
+  if (unsupportedTypes.length > 0) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["MEDIA_TYPES"],
+      message: `Unsupported MEDIA_TYPES: ${unsupportedTypes.join(", ")}`,
+    });
+  }
+  if (config.MEDIA_SEGMENT_OVERLAP_SECONDS >= config.MEDIA_SEGMENT_SECONDS) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["MEDIA_SEGMENT_OVERLAP_SECONDS"],
+      message: "MEDIA_SEGMENT_OVERLAP_SECONDS must be smaller than MEDIA_SEGMENT_SECONDS",
+    });
+  }
+  if (config.S3_SESSION_TOKEN && !config.S3_CREDENTIALS_EXPIRES_AT) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["S3_CREDENTIALS_EXPIRES_AT"],
+      message: "S3_CREDENTIALS_EXPIRES_AT is required when S3_SESSION_TOKEN is set",
+    });
+  }
+
   const required = [
     "S3_REGION",
     "S3_BUCKET",
@@ -130,6 +162,7 @@ const schema = z.object({
     config.S3_ACCESS_KEY_ID,
     config.S3_SECRET_ACCESS_KEY,
     config.S3_SESSION_TOKEN,
+    config.S3_CREDENTIALS_EXPIRES_AT,
   ].some((value) => value !== undefined);
 
   if (config.MEDIA_TYPES.length === 0 && !anyStorageSetting) return;
@@ -154,7 +187,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
   return {
     ...parsed,
     EMBEDDING_API_KEY: parsed.EMBEDDING_API_KEY ?? parsed.OPENROUTER_API_KEY,
-    MEDIA_API_KEY: parsed.MEDIA_API_KEY ?? parsed.OPENROUTER_API_KEY,
     mediaSince: parsed.MEDIA_SINCE ? new Date(parsed.MEDIA_SINCE) : undefined,
     telegramEnabled: Boolean(
       parsed.TELEGRAM_API_ID && parsed.TELEGRAM_API_HASH && parsed.TELEGRAM_SESSION,

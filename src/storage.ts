@@ -41,6 +41,7 @@ export interface SignedGetUrl {
 }
 
 export interface ObjectStorage {
+  readonly bucket: string;
   saveOriginal(input: SaveOriginalInput): Promise<StoredOriginal>;
   readOriginal(key: string): Promise<Buffer>;
   signGet(key: string): Promise<SignedGetUrl>;
@@ -55,13 +56,15 @@ export function createObjectStorage(config: S3StorageConfig): ObjectStorage {
 class S3ObjectStorage implements ObjectStorage {
   private readonly client: S3Client;
   private readonly config: S3StorageConfig;
+  readonly bucket: string;
   private closed = false;
 
   constructor(config: S3StorageConfig) {
     this.config = config;
+    this.bucket = config.bucket;
     if (!config.region || !config.bucket) throw new TypeError("S3 region and bucket are required");
-    if (!Number.isInteger(config.urlTtlSeconds) || config.urlTtlSeconds < 1) {
-      throw new TypeError("S3 URL TTL must be a positive integer");
+    if (!Number.isInteger(config.urlTtlSeconds) || config.urlTtlSeconds < 1 || config.urlTtlSeconds > 604_800) {
+      throw new TypeError("S3 URL TTL must be an integer between 1 and 604800 seconds");
     }
     this.client = this.newClient(config.credentials);
   }
@@ -71,7 +74,7 @@ class S3ObjectStorage implements ObjectStorage {
     if (!input.contentType || /[\r\n]/.test(input.contentType)) {
       throw new TypeError("A valid content type is required");
     }
-    if (input.filename !== undefined && /[\r\n\0]/.test(input.filename)) {
+    if (input.filename !== undefined && /[\u0000-\u001f\u007f]/.test(input.filename)) {
       throw new TypeError("Filename metadata cannot contain control characters");
     }
     const encodedFilename = input.filename === undefined ? undefined : encodeURIComponent(input.filename);

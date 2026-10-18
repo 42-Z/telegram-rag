@@ -74,7 +74,15 @@ describe("сервис через драйвер pg", async () => {
     const store = new Store(db);
     await seed(store);
     const embedder = fakeEmbedder();
-    const indexer = new Indexer(store, embedder, 64);
+    const indexer = new Indexer(store, embedder, {
+      batchSize: 64,
+      concurrency: 1,
+      mediaTypes: [],
+      maxMediaBytes: 20 * 1_048_576,
+      maxMediaSeconds: 1800,
+      segmentSeconds: 60,
+      segmentOverlapSeconds: 5,
+    });
     while ((await indexer.runOnce()) > 0);
 
     // int8, jsonb, даты и векторы проходят через драйвер без потерь

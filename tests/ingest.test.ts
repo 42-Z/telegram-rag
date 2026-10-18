@@ -7,6 +7,7 @@ import bigInt from "big-integer";
 import { Api } from "teleproto";
 import { afterAll, describe, expect, it } from "vitest";
 import { Ingestor } from "../src/telegram/ingest.ts";
+import { normalizeMessage } from "../src/telegram/normalize.ts";
 import { freshStore } from "./helpers.ts";
 
 const CHANNEL_ID = 777;
@@ -39,6 +40,7 @@ function fakeClient(history: Api.TypeMessage[]) {
   const client = {
     history,
     iterCalls: [] as any[],
+    downloadCalls: 0,
     async connect() {},
     async disconnect() {},
     async getMe() {
@@ -63,8 +65,16 @@ function fakeClient(history: Api.TypeMessage[]) {
         yield* list;
       })();
     },
-    async getMessages(_peer: unknown, params: { limit: number }) {
+    async getMessages(_peer: unknown, params: { limit?: number; ids?: number | number[] }) {
+      if (params.ids !== undefined) {
+        const ids = new Set(Array.isArray(params.ids) ? params.ids : [params.ids]);
+        return client.history.filter((message) => ids.has(message.id));
+      }
       return [...client.history].sort((a, b) => b.id - a.id).slice(0, params.limit);
+    },
+    async downloadMedia() {
+      client.downloadCalls += 1;
+      return Buffer.from("telegram-original");
     },
     updates: {
       on(name: string, handler: any) {
@@ -133,6 +143,30 @@ describe("Ingestor", () => {
     expect(client.iterCalls.at(-1)).toMatchObject({ reverse: true, minId: 4 });
     expect((await store.getPost(CHANNEL_ID, 5))?.text).toBe("Пятый пост");
     expect((await store.listChannels())[0]!.lastMessageId).toBe(5);
+  });
+
+  it("не скачивает файл, если Telegram уже заменил вложение в сообщении", async () => {
+    await ingestor.addChannel("@live", { sync: false });
+    const mediaMessage = makeMessage(8, "Файл");
+    (mediaMessage as any).media = {
+      className: "MessageMediaDocument",
+      document: {
+        id: bigInt(123),
+        mimeType: "audio/ogg",
+        size: 12,
+        attributes: [{ className: "DocumentAttributeAudio", voice: true, duration: 2 }],
+      },
+    };
+    client.history.push(mediaMessage);
+    const original = normalizeMessage(CHANNEL_ID, mediaMessage).media!;
+    expect(original.fileId).toBe("123");
+    await expect(ingestor.downloadMedia(CHANNEL_ID, 8, original)).resolves.toEqual(Buffer.from("telegram-original"));
+    expect(client.downloadCalls).toBe(1);
+    (mediaMessage as any).media.document.id = bigInt(456);
+
+    await expect(ingestor.downloadMedia(CHANNEL_ID, 8, original)).rejects.toThrow(/изменилось/);
+    expect(client.downloadCalls).toBe(1);
+    client.history.splice(client.history.indexOf(mediaMessage), 1);
   });
 
   it("живые обновления: новый пост, правка, удаление", async () => {

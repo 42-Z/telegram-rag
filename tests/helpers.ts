@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { migrate, openDb, type Db } from "../src/db.ts";
-import type { Embedder } from "../src/embeddings.ts";
+import type { Embedder, EmbeddingInput } from "../src/embeddings.ts";
 import { Store } from "../src/store.ts";
 import { normalizeMessage, type MessageLike } from "../src/telegram/normalize.ts";
 
@@ -16,9 +16,12 @@ export function fakeEmbedder(): Embedder & { calls: number } {
     model: "fake",
     dimensions: DIMENSIONS,
     calls: 0,
-    async embed(texts: readonly string[]) {
+    async embed(inputs: readonly EmbeddingInput[]) {
       embedder.calls += 1;
-      return texts.map((text) => {
+      return inputs.map((input) => {
+        const text = input.type === "text"
+          ? input.text
+          : input.parts.map((part) => part.type === "text" ? part.text : Buffer.from(part.data).toString("base64")).join(" ");
         const vector = new Array<number>(DIMENSIONS).fill(0);
         for (const word of text.toLowerCase().match(/[\p{L}\d]{3,}/gu) ?? []) {
           const stem = word.slice(0, 5);

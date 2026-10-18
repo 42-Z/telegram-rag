@@ -54,6 +54,23 @@ dev) — нужен Pro или отдельная организация.
 2. **Connect** — строка как есть (в ней уже `sslmode=require&channel_binding=require`).
    Сертификат у Neon публичный, `DATABASE_CA_CERT` не нужен.
 
+#### S3-compatible object storage
+
+Если `MEDIA_TYPES` не пуст, нужен приватный S3-compatible bucket с доступом на
+чтение и запись. Укажите `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`,
+`S3_ACCESS_KEY_ID` и `S3_SECRET_ACCESS_KEY`. `S3_ENDPOINT` должен быть
+доступен и контейнеру, и клиентским агентам: сервис выдаёт подписанную ссылку
+напрямую на объект, не проксируя скачивание. Для Neon Object Storage включите
+path-style (`S3_FORCE_PATH_STYLE=true`) и используйте endpoint текущей ветки;
+это beta-функция для новых проектов в `us-east-2`, bucket и данные привязаны к
+ветке базы. См. [документацию Neon Object Storage](https://neon.com/docs/storage/get-started).
+
+Bucket оставьте приватным. Подписанные GET URL действуют
+`S3_URL_TTL_SECONDS` (по умолчанию один час, максимум семь дней). Обладатель
+ссылки может скачать объект до истечения срока; подпись не шифрует файл и
+приложение не добавляет отдельное шифрование. Доступы хранятся только в
+`/etc/telegram-rag.env` с правами `600`.
+
 ## Первая настройка сервера (один раз)
 
 ```bash
@@ -71,6 +88,22 @@ TELEGRAM_API_HASH=
 TELEGRAM_SESSION=
 TELEGRAM_CHANNELS=
 OPENROUTER_API_KEY=
+# Private S3-compatible storage (required when MEDIA_TYPES is non-empty).
+S3_ENDPOINT=
+S3_REGION=
+S3_BUCKET=
+S3_ACCESS_KEY_ID=
+S3_SECRET_ACCESS_KEY=
+# S3_SESSION_TOKEN=             # only for temporary credentials
+# S3_CREDENTIALS_EXPIRES_AT=    # required with S3_SESSION_TOKEN; ISO 8601
+S3_FORCE_PATH_STYLE=true
+S3_URL_TTL_SECONDS=3600
+MEDIA_TYPES=photo,voice,video_note,audio,video,gif
+MEDIA_SINCE=
+MEDIA_MAX_MB=20
+MEDIA_MAX_SECONDS=1800
+MEDIA_SEGMENT_SECONDS=60
+MEDIA_SEGMENT_OVERLAP_SECONDS=5
 API_TOKEN=
 ADMIN_TOKEN=
 PUBLIC_URL=https://telegram-rag.zomb.top
