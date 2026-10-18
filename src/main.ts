@@ -23,8 +23,7 @@ try {
   await migrate(db, {
     model: config.embedding.model,
     dimensions: config.embedding.dimensions,
-    profile: JSON.stringify({
-      pipeline: "source-multimodal-v1",
+    mediaProfile: JSON.stringify({
       modalities: [...config.embedding.modalities].sort(),
       mediaTypes: [...MEDIA_TYPES].sort(),
       mediaSince: config.MEDIA_SINCE ?? null,
@@ -90,7 +89,9 @@ const source = ingestor;
 indexer = new Indexer(store, embedder, {
   batchSize: config.EMBEDDING_BATCH_SIZE,
   concurrency: config.MEDIA_CONCURRENCY,
-  mediaTypes: source ? MEDIA_TYPES : [],
+  // Сохранённые оригиналы читаются из S3 и без Telegram, поэтому типы нужны всегда:
+  // иначе переиндексация без Telegram стёрла бы векторы медиа.
+  mediaTypes: MEDIA_TYPES,
   mediaSince: config.mediaSince,
   maxMediaBytes: config.MEDIA_MAX_MB * 1_048_576,
   maxMediaSeconds: config.MEDIA_MAX_SECONDS,
@@ -129,10 +130,20 @@ const server = serve({ fetch: app.fetch, port: config.PORT, hostname: "0.0.0.0" 
 );
 
 let closing = false;
+/** Docker по умолчанию ждёт 10 с после SIGTERM, потом убивает процесс без закрытия базы. */
+const SHUTDOWN_TIMEOUT_MS = 8_000;
 async function shutdown(signal: string) {
-  if (closing) return;
+  if (closing) {
+    log.warn(`${signal}: повторный сигнал, выхожу сразу`);
+    process.exit(1);
+  }
   closing = true;
   log.info(`${signal}: остановка`);
+  // Эмбеддинг в полёте или скачивание файла остановить нельзя; пост при этом остаётся в очереди.
+  setTimeout(() => {
+    log.error("остановка не уложилась в срок, выхожу принудительно");
+    process.exit(1);
+  }, SHUTDOWN_TIMEOUT_MS).unref();
   server.close();
   await indexer?.stop().catch(() => {});
   await ingestor?.stop().catch(() => {});

@@ -10,7 +10,7 @@ import { inspectMedia, mediaFileName, mediaModality, prepareMediaChunks, sniffMi
 import { type MediaProbe } from "./media/ffmpeg.ts";
 import type { PreparedMediaChunk } from "./media/prepare.ts";
 import type { ObjectStorage } from "./storage.ts";
-import type { MediaAsset, MediaAssetReference, MediaJob, Store } from "./store.ts";
+import type { IndexedChunk, MediaAsset, MediaAssetReference, MediaJob, Store } from "./store.ts";
 import { mediaSourceFingerprint, searchableText } from "./telegram/normalize.ts";
 
 const log = logger("indexer");
@@ -140,14 +140,15 @@ export class Indexer {
       return { asset, bytes: Buffer.alloc(0), info: undefined, skipReason: reason };
     }
 
+    // Размер из Telegram известен до скачивания: гигабайтное видео не грузим в память.
+    const claimedSize = job.media.size;
+    if (claimedSize && claimedSize > this.options.maxMediaBytes) {
+      return this.skipOversized(job, asset, Buffer.alloc(0), claimedSize);
+    }
+
     const bytes = await download(job.channelId, job.messageId, job.media);
     if (bytes.length === 0) throw new Error("Telegram отдал пустой файл");
-    if (bytes.length > this.options.maxMediaBytes) {
-      const reason = `файл ${(bytes.length / 1_048_576).toFixed(1)} МБ превышает MEDIA_MAX_MB`;
-      await this.store.markMediaStorageSkipped(assetRef(job), reason);
-      await this.store.markMediaEmbeddingSkipped(assetRef(job), reason);
-      return { asset, bytes, info: undefined, skipReason: reason };
-    }
+    if (bytes.length > this.options.maxMediaBytes) return this.skipOversized(job, asset, bytes, bytes.length);
 
     let info: SavedOriginal["info"];
     let skipReason: string | undefined;
@@ -173,14 +174,32 @@ export class Indexer {
     return { asset: savedAsset, bytes, info, skipReason };
   }
 
+  private async skipOversized(job: MediaJob, asset: MediaAsset, bytes: Buffer, size: number): Promise<SavedOriginal> {
+    const reason = `файл ${(size / 1_048_576).toFixed(1)} МБ превышает MEDIA_MAX_MB`;
+    await this.store.markMediaStorageSkipped(assetRef(job), reason);
+    await this.store.markMediaEmbeddingSkipped(assetRef(job), reason);
+    return { asset, bytes, info: undefined, skipReason: reason };
+  }
+
   private async processPost(post: Awaited<ReturnType<Store["pendingForEmbedding"]>>[number]): Promise<void> {
     const media = post.media;
     const mediaJob: MediaJob | undefined = media
       ? { channelId: post.channelId, messageId: post.messageId, date: new Date(post.date), text: post.text, media }
       : undefined;
     const mediaSelected = Boolean(media && this.options.mediaTypes.includes(media.type));
-    const original = mediaSelected && mediaJob ? await this.saveOriginal(mediaJob) : undefined;
-    if (mediaSelected && !original) return; // сообщение успели изменить или удалить
+
+    let original: SavedOriginal | undefined;
+    if (mediaSelected && mediaJob) {
+      try {
+        original = await this.saveOriginal(mediaJob);
+        if (!original) return; // сообщение успели изменить или удалить
+      } catch (error) {
+        // Сбой скачивания, S3 или чтения оригинала касается только вложения: пометим его
+        // для повтора (`retry-failed`), а текст поста проиндексируем как обычно.
+        await this.store.markMediaStorageFailed(assetRef(mediaJob), String(error));
+        log.warn(`вложение ${post.channelId}/${post.messageId} не сохранено`, error);
+      }
+    }
 
     let mediaSkipReason = original?.skipReason;
     if (mediaSkipReason && mediaJob) {
@@ -203,14 +222,7 @@ export class Indexer {
 
     const text = searchableText(post);
     const textChunks = buildChunks({ channelTitle: post.channelTitle, date: new Date(post.date), text });
-    const chunks = [] as Array<{
-      kind: "text" | "image" | "audio" | "video";
-      content?: string | null;
-      mediaAssetId?: number | null;
-      startSeconds?: number | null;
-      endSeconds?: number | null;
-      embedding: readonly number[];
-    }>;
+    const chunks: IndexedChunk[] = [];
 
     if (textChunks.length > 0) {
       const vectors = await this.embedder.embed(textChunks.map(asDocument));
@@ -219,25 +231,26 @@ export class Indexer {
     }
 
     if (original && mediaJob && !mediaSkipReason) {
-      await this.appendMediaVectors(post, original, chunks);
+      // Остановка посреди длинного файла: пост остаётся в очереди, ничего не записываем.
+      if ((await this.appendMediaVectors(post, original, chunks)) === "stopped") return;
     }
 
     await this.store.replaceChunks(post, chunks);
   }
 
+  /**
+   * Добавляет в `chunks` векторы всех сегментов вложения — либо ни одного: частично
+   * подготовленный файл не должен выглядеть проиндексированным. Сбой вложения только
+   * помечает его (`skipped` для неподготовленного медиа, `failed` для ошибки эмбеддинга) и
+   * не мешает записать текстовые векторы поста.
+   */
   private async appendMediaVectors(
     post: Awaited<ReturnType<Store["pendingForEmbedding"]>>[number],
     original: SavedOriginal,
-    chunks: Array<{
-      kind: "text" | "image" | "audio" | "video";
-      content?: string | null;
-      mediaAssetId?: number | null;
-      startSeconds?: number | null;
-      endSeconds?: number | null;
-      embedding: readonly number[];
-    }>,
-  ): Promise<void> {
-    if (!original.info) return;
+    chunks: IndexedChunk[],
+  ): Promise<"done" | "skipped" | "failed" | "stopped"> {
+    if (!original.info) return "skipped";
+    const reference = assetRef({ channelId: post.channelId, messageId: post.messageId, media: post.media! });
     const iterator = prepareMediaChunks(original.bytes, post.media!, original.info, {
       windowSeconds: this.options.segmentSeconds,
       overlapSeconds: this.options.segmentOverlapSeconds,
@@ -247,36 +260,42 @@ export class Indexer {
       searchableText(post),
     ].filter(Boolean).join("\n\n");
 
+    const mediaChunks: IndexedChunk[] = [];
     const iterable = iterator[Symbol.asyncIterator]();
     while (true) {
+      if (this.stopped) return "stopped";
       let next: IteratorResult<PreparedMediaChunk>;
       try {
         next = await iterable.next();
       } catch (error) {
         const reason = `не удалось подготовить медиа: ${error instanceof Error ? error.message : String(error)}`;
-        await this.store.markMediaEmbeddingSkipped(assetRef({
-          channelId: post.channelId,
-          messageId: post.messageId,
-          media: post.media!,
-        }), reason);
-        return;
+        await this.store.markMediaEmbeddingSkipped(reference, reason);
+        return "skipped";
       }
-      if (next.done) return;
-      const [embedding] = await this.embedder!.embed([{
-        type: "multimodal",
-        parts: [{ type: "text", text: context || "" }, ...next.value.parts],
-      }]);
-      if (!embedding) throw new Error("Embedding endpoint returned no vector for media");
-      const asset = await this.store.getMediaAsset(post.channelId, post.messageId);
-      if (!asset || asset.storageStatus !== "stored") throw new Error("Saved media asset disappeared before indexing");
-      chunks.push({
-        kind: next.value.kind,
-        mediaAssetId: asset.assetId,
-        startSeconds: next.value.startSeconds,
-        endSeconds: next.value.endSeconds,
-        embedding,
-      });
+      if (next.done) break;
+      try {
+        const [embedding] = await this.embedder.embed([{
+          type: "multimodal",
+          parts: [{ type: "text", text: context || "" }, ...next.value.parts],
+        }]);
+        if (!embedding) throw new Error("Embedding endpoint returned no vector for media");
+        const asset = await this.store.getMediaAsset(post.channelId, post.messageId);
+        if (!asset || asset.storageStatus !== "stored") throw new Error("Saved media asset disappeared before indexing");
+        mediaChunks.push({
+          kind: next.value.kind,
+          mediaAssetId: asset.assetId,
+          startSeconds: next.value.startSeconds,
+          endSeconds: next.value.endSeconds,
+          embedding,
+        });
+      } catch (error) {
+        await this.store.markMediaEmbeddingFailed(reference, String(error));
+        log.warn(`вложение ${post.channelId}/${post.messageId} не проиндексировано`, error);
+        return "failed";
+      }
     }
+    chunks.push(...mediaChunks);
+    return "done";
   }
 
   start(idleMs = 60_000): void {

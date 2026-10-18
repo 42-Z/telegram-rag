@@ -216,7 +216,13 @@ export class Ingestor {
         ? this.client.iterMessages(peer, { limit: this.options.backfillLimit })
         : this.client.iterMessages(peer, { reverse: true, minId: channel.lastMessageId, limit: undefined, waitTime: 1 });
 
+      let interrupted = false;
       for await (const message of iterator as AsyncIterable<MessageLike>) {
+        // Остановка посреди длинной истории: сохраняем прочитанное, остальное дочитаем после запуска.
+        if (this.stopping) {
+          interrupted = true;
+          break;
+        }
         top = Math.max(top, message.id);
         if (isPost(message)) batch.push(normalizeMessage(channel.id, message));
         if (batch.length >= BATCH) {
@@ -225,6 +231,7 @@ export class Ingestor {
         }
       }
       await flush(!firstLimited);
+      if (interrupted) return;
 
       // Недавние посты — ещё раз: просмотры, реакции и правки, пропущенные вживую.
       if (channel.backfillDone) {

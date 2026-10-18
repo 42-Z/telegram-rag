@@ -336,11 +336,14 @@ ${
 /**
  * Приводит базу к текущей схеме. Переход с legacy-анализа на исходный текст и
  * файлы выполняется один раз и очищает старые текстовые векторы. При смене
- * модели, профиля подготовки или размерности векторы также пересоздаются.
+ * модели, профиля подготовки (формата запроса) или размерности пересоздаются все
+ * векторы. Настройки только медиа (`mediaProfile`: модальности, окна сегментов,
+ * лимиты) на текстовые векторы не влияют: при их смене в очередь возвращаются лишь
+ * посты с вложениями, а оригиналы читаются из S3, без повторного скачивания.
  */
 export async function migrate(
   db: Db,
-  embedding: { model: string; dimensions: number; profile?: string },
+  embedding: { model: string; dimensions: number; profile?: string; mediaProfile?: string },
 ): Promise<void> {
   await db.exec(SCHEMA);
   // pgvector ≥ 0.8: при фильтрах по каналу и дате индекс добирает кандидатов,
@@ -396,6 +399,27 @@ export async function migrate(
       `INSERT INTO meta (key, value) VALUES ('embedding', $1)
        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
       [signature],
+    );
+
+    const mediaProfile = embedding.mediaProfile ?? "";
+    const [currentMedia] = await tx.query<{ value: string }>("SELECT value FROM meta WHERE key = 'media_profile'");
+    if (currentMedia && currentMedia.value !== mediaProfile) {
+      log.warn("media profile changed; posts with attachments queued for re-embedding");
+      await tx.exec(`
+        UPDATE media_assets SET
+          storage_status = CASE WHEN storage_status IN ('skipped', 'failed') THEN 'pending' ELSE storage_status END,
+          storage_error = CASE WHEN storage_status IN ('skipped', 'failed') THEN NULL ELSE storage_error END,
+          embedding_status = 'pending', embedding_error = NULL, updated_at = now();
+        UPDATE posts SET embedded_hash = NULL, embed_error = NULL
+          WHERE EXISTS (
+            SELECT 1 FROM media_assets a WHERE a.channel_id = posts.channel_id AND a.message_id = posts.message_id
+          );
+      `);
+    }
+    await tx.query(
+      `INSERT INTO meta (key, value) VALUES ('media_profile', $1)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+      [mediaProfile],
     );
   });
 }

@@ -205,6 +205,28 @@ describe("Ingestor", () => {
     await ingestor.stop();
   });
 
+  it("остановка посреди истории сохраняет прочитанное и не помечает канал дочитанным", async () => {
+    const other = await freshStore();
+    const client = fakeClient([...history]);
+    let stopper: Promise<void> | undefined;
+    const interrupted = new Ingestor(client as never, other.store, { backfillLimit: 0, pollIntervalSeconds: 3600 });
+    client.iterMessages = (() =>
+      (async function* () {
+        yield history[0]!;
+        stopper = interrupted.stop(); // сигнал остановки приходит, пока канал ещё читается
+        yield history[2]!;
+        yield history[3]!;
+      })()) as never;
+    const channel = await interrupted.addChannel("@live", { sync: false });
+    await interrupted.syncChannel(channel);
+    await stopper;
+
+    const { posts } = await other.store.listPosts({ order: "oldest", limit: 10 });
+    expect(posts.map((p) => p.messageId)).toEqual([1]);
+    expect((await other.store.listChannels())[0]).toMatchObject({ lastMessageId: 1, backfillDone: false });
+    await other.db.close();
+  });
+
   it("BACKFILL_LIMIT берёт только последние посты", async () => {
     const other = await freshStore();
     const limited = new Ingestor(fakeClient([...history]) as never, other.store, { backfillLimit: 2, pollIntervalSeconds: 3600 });

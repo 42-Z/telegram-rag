@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { migrate, openDb, type Db } from "../src/db.ts";
-import { normalizeMessage } from "../src/telegram/normalize.ts";
+import { mediaSourceFingerprint, normalizeMessage } from "../src/telegram/normalize.ts";
 import { Store } from "../src/store.ts";
 import { DIMENSIONS, message } from "./helpers.ts";
 
@@ -119,6 +119,50 @@ describe("source-only index migration", () => {
     await migrate(db!, { model: "fake", dimensions: DIMENSIONS, profile: "changed-preparation" });
     expect(await db!.query("SELECT * FROM chunks")).toHaveLength(0);
     expect(await store.pendingForEmbedding(10)).toHaveLength(1);
+  }, 30_000);
+
+  it("requeues only posts with attachments when media settings change, keeping every vector", async () => {
+    const { store, post } = await setup();
+    await store.upsertPosts([normalizeMessage(post.channelId, message(2, "Обычный текстовый пост"))]);
+    await store.ensureMediaAsset({
+      channelId: post.channelId,
+      messageId: post.messageId,
+      sourceFileId: post.media?.fileId,
+      sourceFingerprint: mediaSourceFingerprint(post.media),
+      bucket: "test-media",
+      fileName: "voice.ogg",
+      mimeType: "audio/ogg",
+      size: 100,
+      duration: 2,
+    });
+    const vectors = Array.from({ length: DIMENSIONS }, () => 0.25);
+    const reindex = async () => {
+      for (const pending of await store.pendingForEmbedding(10)) {
+        await store.replaceChunks(
+          { channelId: pending.channelId, messageId: pending.messageId, indexHash: pending.indexHash },
+          [{ content: "вектор", embedding: vectors }],
+        );
+      }
+    };
+    await reindex();
+    await migrate(db!, { model: "fake", dimensions: DIMENSIONS, mediaProfile: "segments=60" });
+    await reindex();
+    expect(await store.pendingForEmbedding(10)).toHaveLength(0);
+
+    // Лимит или окно сегментов поменяли: в очередь возвращается только пост с вложением.
+    await store.markMediaEmbeddingSkipped(
+      { channelId: post.channelId, messageId: post.messageId, sourceFileId: post.media?.fileId, sourceFingerprint: mediaSourceFingerprint(post.media) },
+      "лимит размера",
+    );
+    await migrate(db!, { model: "fake", dimensions: DIMENSIONS, mediaProfile: "segments=30" });
+    expect(await db!.query("SELECT * FROM chunks")).toHaveLength(2);
+    expect((await store.pendingForEmbedding(10)).map((item) => item.messageId)).toEqual([post.messageId]);
+    expect((await store.getMediaAsset(post.channelId, post.messageId))?.embeddingStatus).toBe("pending");
+
+    // Тот же профиль при следующем запуске ничего не возвращает в очередь.
+    await reindex();
+    await migrate(db!, { model: "fake", dimensions: DIMENSIONS, mediaProfile: "segments=30" });
+    expect(await store.pendingForEmbedding(10)).toHaveLength(0);
   }, 30_000);
 
   it("rolls back chunk replacement when a chunk violates its kind constraint", async () => {

@@ -494,9 +494,15 @@ export class Store {
         existing.bucket === input.bucket &&
         (existing.sourceFingerprint === input.sourceFingerprint || input.sourceFileId != null)
       ) {
+        // Для сохранённого файла имя, тип, размер и длительность уже измерены по самим байтам;
+        // заявленные Telegram значения (у фото их нет вовсе) их не затирают.
         const [updated] = await tx.query<MediaAsset>(
-          `UPDATE media_assets SET source_fingerprint = $2, file_name = $3, mime_type = $4,
-             size = $5, duration = $6, updated_at = now()
+          `UPDATE media_assets SET source_fingerprint = $2,
+             file_name = CASE WHEN storage_status = 'stored' THEN file_name ELSE $3 END,
+             mime_type = CASE WHEN storage_status = 'stored' THEN mime_type ELSE $4 END,
+             size = CASE WHEN storage_status = 'stored' THEN size ELSE $5 END,
+             duration = CASE WHEN storage_status = 'stored' THEN duration ELSE $6 END,
+             updated_at = now()
            WHERE asset_id = $1 RETURNING ${MEDIA_ASSET_COLUMNS}`,
           [
             existing.assetId,
@@ -509,6 +515,9 @@ export class Store {
         );
         return updated;
       }
+
+      // Вложение заменили другим файлом: векторы старого больше не описывают пост.
+      if (existing) await tx.query("DELETE FROM chunks WHERE media_asset_id = $1", [existing.assetId]);
 
       const [asset] = await tx.query<MediaAsset>(
         `INSERT INTO media_assets (
@@ -659,6 +668,18 @@ export class Store {
 
   // ── медиа ───────────────────────────────────────────────────────────────
 
+  async markMediaEmbeddingFailed(
+    post: MediaAssetReference,
+    error: string,
+  ): Promise<void> {
+    await this.db.query(
+      `UPDATE media_assets SET embedding_status = 'failed', embedding_error = $5, updated_at = now()
+       WHERE channel_id = $1 AND message_id = $2
+         AND source_file_id IS NOT DISTINCT FROM $3 AND source_fingerprint = $4`,
+      [post.channelId, post.messageId, post.sourceFileId ?? null, post.sourceFingerprint, error.slice(0, 500)],
+    );
+  }
+
   async markMediaEmbeddingSkipped(
     post: MediaAssetReference,
     reason: string,
@@ -759,7 +780,7 @@ export class Store {
          FROM chunks ch
          JOIN posts p ON p.channel_id = ch.channel_id AND p.message_id = ch.message_id
          JOIN channels c ON c.id = p.channel_id
-         WHERE p.embedded_hash = p.index_hash AND ${where}
+         WHERE ${where}
          ORDER BY ch.embedding <=> $1::vector
          LIMIT $${params.length}
        ) k
