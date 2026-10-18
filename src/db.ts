@@ -16,7 +16,14 @@ export interface Db {
   query<T = Record<string, unknown>>(sql: string, params?: readonly unknown[]): Promise<T[]>;
   /** Несколько операторов подряд, без параметров. */
   exec(sql: string): Promise<void>;
+  /** Атомарный блок запросов на одном соединении. Вложенные транзакции не поддерживаются. */
+  transaction<T>(work: (tx: DbTransaction) => Promise<T>): Promise<T>;
   close(): Promise<void>;
+}
+
+export interface DbTransaction {
+  query<T = Record<string, unknown>>(sql: string, params?: readonly unknown[]): Promise<T[]>;
+  exec(sql: string): Promise<void>;
 }
 
 export interface PostgresOptions {
@@ -121,6 +128,35 @@ async function openPostgres(url: string, options: PostgresOptions): Promise<Db> 
     async exec(sql) {
       await pool.query(sql);
     },
+    async transaction(work) {
+      const client = await pool.connect();
+      let released = false;
+      try {
+        await client.query("BEGIN");
+        const tx: DbTransaction = {
+          async query(sql, params = []) {
+            const result = await client.query(sql, params as unknown[]);
+            return result.rows;
+          },
+          async exec(sql) {
+            await client.query(sql);
+          },
+        };
+        const result = await work(tx);
+        await client.query("COMMIT");
+        return result;
+      } catch (error) {
+        try {
+          await client.query("ROLLBACK");
+        } catch {
+          client.release(error instanceof Error ? error : true);
+          released = true;
+        }
+        throw error;
+      } finally {
+        if (!released) client.release();
+      }
+    },
     close: () => pool.end(),
   };
 }
@@ -151,6 +187,20 @@ async function openPglite(url: string): Promise<Db> {
     },
     async exec(sql) {
       await db.exec(sql);
+    },
+    async transaction(work) {
+      return db.transaction(async (transaction) => {
+        const tx: DbTransaction = {
+          async query(sql, params = []) {
+            const result = await transaction.query(sql, params as unknown[], { parsers });
+            return result.rows as never[];
+          },
+          async exec(sql) {
+            await transaction.exec(sql);
+          },
+        };
+        return work(tx);
+      });
     },
     close: () => db.close(),
   };
@@ -197,20 +247,51 @@ CREATE TABLE IF NOT EXISTS posts (
   content_hash    text NOT NULL,
   embedded_hash   text,
   embed_error     text,
-  -- Медиа, превращённое в текст: расшифровка речи, описание, текст на картинке.
-  -- NULL — ещё не разбиралось; done / skipped / failed — итог разбора.
+  -- Старые поля анализа сохраняются только для совместимости со старыми базами;
+  -- новые запросы и индексация их не читают.
   media_status    text,
   media_analysis  jsonb,
   media_text      text,
   media_error     text,
   updated_at      timestamptz NOT NULL DEFAULT now(),
-  -- Отпечаток всего, что индексируется: текст поста и текст из медиа.
-  index_hash      text GENERATED ALWAYS AS (content_hash || coalesce(md5(media_text), '')) STORED,
+  -- Отпечаток исходного текста и идентичности вложения, не сгенерированного анализа.
+  index_hash      text GENERATED ALWAYS AS (
+                    content_hash || ':' || coalesce(media->>'type', '') || ':' || coalesce(media->>'fileId', '') || ':' ||
+                    coalesce(media->>'fileName', '') || ':' || coalesce(media->>'mimeType', '') || ':' ||
+                    coalesce(media->>'size', '') || ':' || coalesce(media->>'duration', '')
+                  ) STORED,
   tsv             tsvector GENERATED ALWAYS AS (
-                    to_tsvector('russian', text || ' ' || coalesce(media->>'searchText', '') || ' ' || coalesce(media_text, ''))
+                    to_tsvector('russian', text || ' ' || coalesce(media->>'searchText', ''))
                   ) STORED,
   PRIMARY KEY (channel_id, message_id)
 );
+
+CREATE TABLE IF NOT EXISTS media_assets (
+  asset_id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  channel_id        bigint NOT NULL,
+  message_id        integer NOT NULL,
+  source_file_id    text,
+  source_fingerprint text NOT NULL,
+  bucket            text NOT NULL,
+  object_key        text,
+  sha256            text,
+  mime_type         text,
+  file_name         text,
+  size              bigint,
+  duration          double precision,
+  storage_status    text NOT NULL DEFAULT 'pending'
+                    CHECK (storage_status IN ('pending', 'stored', 'failed', 'skipped')),
+  storage_error     text,
+  stored_at         timestamptz,
+  embedding_status  text NOT NULL DEFAULT 'pending'
+                    CHECK (embedding_status IN ('pending', 'done', 'failed', 'skipped')),
+  embedding_error   text,
+  updated_at        timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (channel_id, message_id),
+  FOREIGN KEY (channel_id, message_id)
+    REFERENCES posts (channel_id, message_id) ON DELETE CASCADE
+);
+ALTER TABLE media_assets ADD COLUMN IF NOT EXISTS source_fingerprint text;
 
 CREATE INDEX IF NOT EXISTS posts_channel_date ON posts (channel_id, date DESC);
 CREATE INDEX IF NOT EXISTS posts_date ON posts (date DESC);
@@ -218,18 +299,29 @@ CREATE INDEX IF NOT EXISTS posts_tsv ON posts USING gin (tsv);
 CREATE INDEX IF NOT EXISTS posts_grouped ON posts (channel_id, grouped_id) WHERE grouped_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS posts_pending ON posts (channel_id, message_id)
   WHERE embedded_hash IS DISTINCT FROM index_hash AND NOT deleted;
-CREATE INDEX IF NOT EXISTS posts_media_pending ON posts (date DESC)
-  WHERE media_status IS NULL AND media IS NOT NULL AND NOT deleted;
+CREATE INDEX IF NOT EXISTS media_assets_storage_pending ON media_assets (updated_at)
+  WHERE storage_status IN ('pending', 'failed');
 `;
 
 function chunksSchema(dimensions: number): string {
   return `
 CREATE TABLE IF NOT EXISTS chunks (
-  channel_id   bigint NOT NULL,
-  message_id   integer NOT NULL,
-  chunk_index  integer NOT NULL,
-  content      text NOT NULL,
-  embedding    vector(${dimensions}) NOT NULL,
+  channel_id      bigint NOT NULL,
+  message_id      integer NOT NULL,
+  chunk_index     integer NOT NULL,
+  kind            text NOT NULL DEFAULT 'text' CHECK (kind IN ('text', 'image', 'audio', 'video')),
+  media_asset_id  bigint REFERENCES media_assets (asset_id) ON DELETE CASCADE,
+  start_seconds   double precision,
+  end_seconds     double precision,
+  content         text,
+  embedding       vector(${dimensions}) NOT NULL,
+  CHECK (
+    (kind = 'text' AND media_asset_id IS NULL AND content IS NOT NULL AND start_seconds IS NULL AND end_seconds IS NULL)
+    OR
+    (kind <> 'text' AND media_asset_id IS NOT NULL AND content IS NULL
+      AND ((start_seconds IS NULL AND end_seconds IS NULL)
+        OR (start_seconds >= 0 AND end_seconds > start_seconds)))
+  ),
   PRIMARY KEY (channel_id, message_id, chunk_index),
   FOREIGN KEY (channel_id, message_id) REFERENCES posts (channel_id, message_id) ON DELETE CASCADE
 );
@@ -242,11 +334,17 @@ ${
 }
 
 /**
- * Приводит базу к текущей схеме. Если модель эмбеддингов или размер вектора
- * сменились, старые векторы несравнимы с новыми: таблица кусков
- * пересоздаётся, а все посты встают в очередь на переиндексацию.
+ * Приводит базу к текущей схеме. Переход с legacy-анализа на исходный текст и
+ * файлы выполняется один раз и очищает старые текстовые векторы. При смене
+ * модели, профиля подготовки (формата запроса) или размерности пересоздаются все
+ * векторы. Настройки только медиа (`mediaProfile`: модальности, окна сегментов,
+ * лимиты) на текстовые векторы не влияют: при их смене в очередь возвращаются лишь
+ * посты с вложениями, а оригиналы читаются из S3, без повторного скачивания.
  */
-export async function migrate(db: Db, embedding: { model: string; dimensions: number }): Promise<void> {
+export async function migrate(
+  db: Db,
+  embedding: { model: string; dimensions: number; profile?: string; mediaProfile?: string },
+): Promise<void> {
   await db.exec(SCHEMA);
   // pgvector ≥ 0.8: при фильтрах по каналу и дате индекс добирает кандидатов,
   // а не отдаёт меньше запрошенного. Настройка закрепляется за пользователем
@@ -257,16 +355,71 @@ export async function migrate(db: Db, embedding: { model: string; dimensions: nu
   } catch (error) {
     log.warn("hnsw.iterative_scan не закреплён — фильтрованный поиск может вернуть меньше результатов", error);
   }
-  const signature = `${embedding.model}:${embedding.dimensions}`;
-  const [current] = await db.query<{ value: string }>("SELECT value FROM meta WHERE key = 'embedding'");
-  if (current && current.value !== signature) {
-    log.warn(`эмбеддинги сменились (${current.value} → ${signature}), переиндексация всех постов`);
-    await db.exec("DROP TABLE IF EXISTS chunks; UPDATE posts SET embedded_hash = NULL, embed_error = NULL;");
-  }
-  await db.exec(chunksSchema(embedding.dimensions));
-  await db.query(
-    `INSERT INTO meta (key, value) VALUES ('embedding', $1)
-     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-    [signature],
-  );
+  const profile = embedding.profile ?? "source-multimodal-v1";
+  const signature = JSON.stringify({ model: embedding.model, dimensions: embedding.dimensions, profile });
+  await db.transaction(async (tx) => {
+    const [sourceSchema] = await tx.query<{ value: string }>(
+      "SELECT value FROM meta WHERE key = 'source_index_schema'",
+    );
+    if (sourceSchema?.value !== "3") {
+      await tx.exec(`
+        DROP INDEX IF EXISTS posts_tsv;
+        DROP INDEX IF EXISTS posts_pending;
+        DROP INDEX IF EXISTS posts_media_pending;
+        ALTER TABLE posts DROP COLUMN IF EXISTS tsv;
+        ALTER TABLE posts ADD COLUMN tsv tsvector GENERATED ALWAYS AS (
+          to_tsvector('russian', text || ' ' || coalesce(media->>'searchText', ''))
+        ) STORED;
+        ALTER TABLE posts DROP COLUMN IF EXISTS index_hash;
+        ALTER TABLE posts ADD COLUMN index_hash text GENERATED ALWAYS AS (
+          content_hash || ':' || coalesce(media->>'type', '') || ':' || coalesce(media->>'fileId', '') || ':' ||
+          coalesce(media->>'fileName', '') || ':' || coalesce(media->>'mimeType', '') || ':' ||
+          coalesce(media->>'size', '') || ':' || coalesce(media->>'duration', '')
+        ) STORED;
+        DROP TABLE IF EXISTS chunks;
+        CREATE INDEX posts_tsv ON posts USING gin (tsv);
+        CREATE INDEX posts_pending ON posts (channel_id, message_id)
+          WHERE embedded_hash IS DISTINCT FROM index_hash AND NOT deleted;
+        UPDATE posts SET embedded_hash = NULL, embed_error = NULL;
+      `);
+      await tx.query(
+        `INSERT INTO meta (key, value) VALUES ('source_index_schema', '3')
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+      );
+      log.info("legacy media text excluded from search; source index queued for rebuild");
+    }
+
+    const [current] = await tx.query<{ value: string }>("SELECT value FROM meta WHERE key = 'embedding'");
+    if (current && current.value !== signature) {
+      log.warn("embedding profile changed; reindexing posts");
+      await tx.exec("DROP TABLE IF EXISTS chunks; UPDATE posts SET embedded_hash = NULL, embed_error = NULL;");
+    }
+    await tx.exec(chunksSchema(embedding.dimensions));
+    await tx.query(
+      `INSERT INTO meta (key, value) VALUES ('embedding', $1)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+      [signature],
+    );
+
+    const mediaProfile = embedding.mediaProfile ?? "";
+    const [currentMedia] = await tx.query<{ value: string }>("SELECT value FROM meta WHERE key = 'media_profile'");
+    if (currentMedia && currentMedia.value !== mediaProfile) {
+      log.warn("media profile changed; posts with attachments queued for re-embedding");
+      await tx.exec(`
+        UPDATE media_assets SET
+          storage_status = CASE WHEN storage_status IN ('skipped', 'failed') THEN 'pending' ELSE storage_status END,
+          storage_error = CASE WHEN storage_status IN ('skipped', 'failed') THEN NULL ELSE storage_error END,
+          embedding_status = 'pending', embedding_error = NULL, updated_at = now();
+        UPDATE posts SET embedded_hash = NULL, embed_error = NULL
+          WHERE EXISTS (
+            SELECT 1 FROM media_assets a WHERE a.channel_id = posts.channel_id AND a.message_id = posts.message_id
+          );
+      `);
+    }
+    await tx.query(
+      `INSERT INTO meta (key, value) VALUES ('media_profile', $1)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+      [mediaProfile],
+    );
+  });
 }

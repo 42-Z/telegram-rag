@@ -1,192 +1,542 @@
-/**
- * Медиа → текст: настоящий ffmpeg на сгенерированных файлах, подменённые
- * Telegram (скачивание) и модель (разбор).
- */
-
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
-import { buildUserContent, mediaText, parseAnalysis, type MediaInput } from "../src/media/analyzer.ts";
-import { extractFrames, resizeImage, toMp3 } from "../src/media/ffmpeg.ts";
-import { MediaProcessor } from "../src/media/processor.ts";
-import { Indexer } from "../src/indexer.ts";
-import { callTool } from "../src/tools.ts";
-import { normalizeMessage } from "../src/telegram/normalize.ts";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
+import type { Embedder, EmbeddingInput } from "../src/embeddings.ts";
+import { Indexer, type IndexerOptions } from "../src/indexer.ts";
+import { presentPostMedia } from "../src/presentation.ts";
+import type { ObjectStorage, SaveOriginalInput, StoredOriginal } from "../src/storage.ts";
+import { normalizeMessage, type PostMedia } from "../src/telegram/normalize.ts";
 import { fakeEmbedder, freshStore, message } from "./helpers.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "telegram-rag-test-"));
+// Подмена подготовки медиа нужна одному тесту: ffmpeg сложно заставить упасть на середине файла.
+const prepareHook = vi.hoisted(() => ({ override: undefined as undefined | ((...args: any[]) => AsyncGenerator<any>) }));
+vi.mock("../src/media/prepare.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/media/prepare.ts")>();
+  return {
+    ...actual,
+    prepareMediaChunks: (...args: Parameters<typeof actual.prepareMediaChunks>) =>
+      prepareHook.override ? prepareHook.override(...args) : actual.prepareMediaChunks(...args),
+  };
+});
+afterEach(() => {
+  prepareHook.override = undefined;
+});
+
+const dir = mkdtempSync(join(tmpdir(), "telegram-rag-media-test-"));
 function generate(name: string, args: string[]): Buffer {
   const out = join(dir, name);
   execFileSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", ...args, out]);
   return readFileSync(out);
 }
 
-// Голосовое Telegram — OGG/Opus, кружок — квадратное MP4 со звуком.
-const voice = generate("voice.ogg", ["-f", "lavfi", "-i", "sine=frequency=440:duration=3", "-c:a", "libopus"]);
-const circle = generate("circle.mp4", [
-  "-f", "lavfi", "-i", "testsrc=size=384x384:rate=25:duration=4",
-  "-f", "lavfi", "-i", "sine=frequency=300:duration=4",
+const voice = generate("voice.ogg", ["-f", "lavfi", "-i", "sine=frequency=440:duration=2.4", "-c:a", "libopus"]);
+const video = generate("video.mp4", [
+  "-f", "lavfi", "-i", "testsrc=size=320x240:rate=10:duration=2.5",
+  "-f", "lavfi", "-i", "sine=frequency=300:duration=2.5",
   "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
 ]);
-const silentVideo = generate("silent.mp4", ["-f", "lavfi", "-i", "testsrc=size=320x240:rate=25:duration=2", "-c:v", "libx264", "-pix_fmt", "yuv420p"]);
-const photo = generate("photo.png", ["-f", "lavfi", "-i", "testsrc=size=3000x2000", "-frames:v", "1"]);
+const silentVideo = generate("silent.mp4", [
+  "-f", "lavfi", "-i", "testsrc=size=320x240:rate=10:duration=1.2",
+  "-c:v", "libx264", "-pix_fmt", "yuv420p",
+]);
+const photo = generate("photo.png", ["-f", "lavfi", "-i", "testsrc=size=640x480", "-frames:v", "1"]);
+const gif = generate("animated.gif", [
+  "-f", "lavfi", "-i", "testsrc=size=160x120:rate=5:duration=1.8",
+  "-vf", "format=rgb8", "-loop", "0", "-f", "gif",
+]);
+const audio = generate("audio.mp3", ["-f", "lavfi", "-i", "sine=frequency=600:duration=1.5", "-c:a", "libmp3lame"]);
 
-const isJpeg = (b: Buffer) => b[0] === 0xff && b[1] === 0xd8;
-const isMp3 = (b: Buffer) => b.subarray(0, 3).toString() === "ID3" || (b[0] === 0xff && (b[1]! & 0xe0) === 0xe0);
-
-describe("ffmpeg", () => {
-  it("голосовое → mp3", async () => {
-    const mp3 = await toMp3(voice);
-    expect(mp3 && isMp3(mp3)).toBe(true);
-  });
-
-  it("кружок → кадры и звук", async () => {
-    const frames = await extractFrames(circle, 4, 3);
-    expect(frames).toHaveLength(3);
-    expect(frames.every(isJpeg)).toBe(true);
-    expect(await toMp3(circle)).not.toBeNull();
-  });
-
-  it("видео без звука → звука нет, а не ошибка", async () => {
-    expect(await toMp3(silentVideo)).toBeNull();
-  });
-
-  it("большое фото уменьшается до JPEG", async () => {
-    const jpeg = await resizeImage(photo, 1536);
-    expect(isJpeg(jpeg)).toBe(true);
-    const out = join(dir, "resized.jpg");
-    writeFileSync(out, jpeg);
-    const size = execFileSync("ffprobe", ["-v", "error", "-show_entries", "stream=width,height", "-of", "csv=p=0", out]).toString().trim();
-    expect(size).toBe("1536,1024");
-  });
+const files: Record<number, Buffer> = { 1: voice, 2: photo, 3: video, 4: silentVideo, 5: gif, 6: audio };
+const mediaFor = (type: string, fileId: number, mimeType: string, duration: number, fileName: string) => ({
+  ...(type === "photo"
+    ? { className: "MessageMediaPhoto", photo: { id: { toString: () => String(fileId) } } }
+    : {
+        className: "MessageMediaDocument",
+        document: {
+          id: { toString: () => String(fileId) },
+          mimeType,
+          size: files[fileId]?.byteLength ?? 100,
+          attributes: [
+            { className: "DocumentAttributeFilename", fileName },
+            ...(type === "voice" ? [{ className: "DocumentAttributeAudio", voice: true, duration }] : []),
+            ...(type === "audio" ? [{ className: "DocumentAttributeAudio", duration, title: "тон" }] : []),
+            ...(type === "video_note" ? [{ className: "DocumentAttributeVideo", roundMessage: true, duration }] : []),
+            ...(type === "video" ? [{ className: "DocumentAttributeVideo", duration }] : []),
+            ...(type === "gif" ? [{ className: "DocumentAttributeAnimated" }, { className: "DocumentAttributeVideo", duration }] : []),
+          ],
+        },
+      }),
 });
 
-describe("запрос и ответ модели", () => {
-  it("звук — input_audio mp3, картинки — data-URL", () => {
-    const parts = buildUserContent({ type: "video_note", images: [Buffer.from("img")], audio: Buffer.from("snd"), caption: "Подпись" });
-    expect(parts[0]).toMatchObject({ type: "text" });
-    expect((parts[0] as any).text).toContain("кружок");
-    expect(parts[1]).toEqual({ type: "image_url", image_url: { url: "data:image/jpeg;base64,aW1n" } });
-    expect(parts[2]).toEqual({ type: "input_audio", input_audio: { data: "c25k", format: "mp3" } });
-  });
-
-  it("ответ по схеме и без неё", () => {
-    expect(parseAnalysis('{"transcript":"Привет","description":"","text_on_image":" "}', "m")).toEqual({
-      transcript: "Привет",
-      description: undefined,
-      textOnImage: undefined,
-      model: "m",
-    });
-    expect(parseAnalysis("просто текст", "m").description).toBe("просто текст");
-  });
-
-  it("текст для поиска", () => {
-    expect(mediaText("voice", 75, { transcript: "Всем привет" })).toBe("[Голосовое сообщение, 1:15]\nРасшифровка: Всем привет");
-    expect(mediaText("photo", undefined, {})).toBeNull();
-  });
-});
-
-describe("очередь медиа", async () => {
-  const { db, store } = await freshStore();
-  afterAll(() => db.close());
-  await store.upsertChannel({ id: 1, ref: "@ch", username: "ch", title: "Канал", about: null, accessHash: "1" });
-  const doc = (mimeType: string, attributes: unknown[], id: number, size = 1000) => ({
-    className: "MessageMediaDocument",
-    document: { id: { toString: () => String(id) }, mimeType, size, attributes },
-  });
-  await store.upsertPosts([
-    normalizeMessage(1, message(1, "", { media: doc("audio/ogg", [{ className: "DocumentAttributeAudio", voice: true, duration: 3 }], 11) })),
-    normalizeMessage(1, message(2, "Смотрите кружок", { media: doc("video/mp4", [{ className: "DocumentAttributeVideo", roundMessage: true, duration: 4 }], 12) })),
-    normalizeMessage(1, message(3, "Фото дня", { media: { className: "MessageMediaPhoto", photo: { id: { toString: () => "13" } } } })),
-    normalizeMessage(1, message(4, "Огромное видео", { media: doc("video/mp4", [{ className: "DocumentAttributeVideo", duration: 10 }], 14, 999_000_000) })),
-    normalizeMessage(1, message(5, "Длинное голосовое", { media: doc("audio/ogg", [{ className: "DocumentAttributeAudio", voice: true, duration: 7200 }], 15) })),
-    normalizeMessage(1, message(6, "Просто текст")),
-  ]);
-
-  const files: Record<number, Buffer> = { 1: voice, 2: circle, 3: photo };
-  const seen: MediaInput[] = [];
-  const analyzer = {
-    model: "fake-vision",
-    async analyze(input: MediaInput) {
-      seen.push(input);
-      if (input.type === "voice") return { transcript: "Договорились встретиться в четверг у фонтана", model: "fake-vision" };
-      if (input.type === "video_note") return { transcript: "Показываю новый ноутбук", description: "Человек держит ноутбук", model: "fake-vision" };
-      return { description: "Закат над морем", textOnImage: "ПЯТНИЦА", model: "fake-vision" };
+function makeStorage() {
+  const objects = new Map<string, { bytes: Buffer; mimeType: string }>();
+  const storage: ObjectStorage = {
+    bucket: "test-media",
+    async saveOriginal(input: SaveOriginalInput): Promise<StoredOriginal> {
+      const sha256 = createHash("sha256").update(input.bytes).digest("hex");
+      const key = `sha256/${sha256}`;
+      const bytes = Buffer.from(input.bytes);
+      objects.set(key, { bytes, mimeType: input.contentType });
+      return { key, sha256, size: bytes.byteLength, contentType: input.contentType };
     },
+    async readOriginal(key) {
+      const object = objects.get(key);
+      if (!object) throw new Error("missing test object");
+      return Buffer.from(object.bytes);
+    },
+    async signGet(key) {
+      return { url: `https://objects.example.test/${key}?signed=1`, expiresIn: 60, expiresAt: new Date(Date.now() + 60_000) };
+    },
+    async close() {},
   };
-  const processor = new MediaProcessor(store, analyzer, async (_c, id) => files[id] ?? Buffer.alloc(0), {
-    types: ["photo", "voice", "video_note", "video"],
-    maxBytes: 20 * 1_048_576,
-    maxSeconds: 1800,
+  return { storage, objects };
+}
+
+function indexerOptions(
+  storage: ObjectStorage,
+  download: (id: number, media: PostMedia) => Promise<Buffer>,
+  overrides: Partial<IndexerOptions> = {},
+) {
+  return {
+    batchSize: 64,
     concurrency: 2,
-  });
-  while ((await processor.runOnce()) > 0);
+    mediaTypes: ["photo", "voice", "video_note", "audio", "video", "gif"],
+    maxMediaBytes: 20 * 1_048_576,
+    maxMediaSeconds: 1800,
+    segmentSeconds: 1,
+    segmentOverlapSeconds: 0.25,
+    storage,
+    downloadMedia: async (_channelId: number, messageId: number, expected: PostMedia) => download(messageId, expected),
+    ...overrides,
+  };
+}
 
-  it("каждый тип подготовлен по-своему", () => {
-    const byType = Object.fromEntries(seen.map((input) => [input.type, input]));
-    expect(byType.voice).toMatchObject({ images: [] });
-    expect(byType.voice!.audio && isMp3(byType.voice!.audio)).toBe(true);
-    expect(byType.video_note!.images).toHaveLength(3);
-    expect(byType.video_note!.audio).not.toBeNull();
-    expect(byType.video_note!.caption).toBe("Смотрите кружок");
-    expect(byType.photo!.images).toHaveLength(1);
-    expect(byType.photo!.audio).toBeNull();
-  });
+describe("direct media embedding pipeline", () => {
+  it("stores unchanged originals and creates separate typed vectors with aligned time ranges", async () => {
+    const { db, store } = await freshStore();
+    try {
+      await store.upsertChannel({ id: 9001, ref: "@media", username: "media", title: "Медиа", about: null, accessHash: "1" });
+      await store.upsertPosts([
+        normalizeMessage(9001, message(1, "", { media: mediaFor("voice", 1, "audio/ogg", 2.4, "voice.ogg") })),
+        normalizeMessage(9001, message(2, "Подпись фото", { media: mediaFor("photo", 2, "image/png", 0, "photo.png") })),
+        normalizeMessage(9001, message(3, "Звук и изображение", { media: mediaFor("video", 3, "video/mp4", 2.5, "video.mp4") })),
+        normalizeMessage(9001, message(4, "Немое видео", { media: mediaFor("video", 4, "video/mp4", 1.2, "silent.mp4") })),
+        normalizeMessage(9001, message(5, "Анимация", { media: mediaFor("gif", 5, "image/gif", 1.8, "animated.gif") })),
+        normalizeMessage(9001, message(6, "Аудиотрек", { media: mediaFor("audio", 6, "audio/mpeg", 1.5, "audio.mp3") })),
+        normalizeMessage(9001, message(7, "Обычный текст без файла")),
+      ]);
+      const { storage, objects } = makeStorage();
+      const base = fakeEmbedder();
+      const seen: EmbeddingInput[] = [];
+      const embedder: Embedder = {
+        model: base.model,
+        dimensions: base.dimensions,
+        modalities: base.modalities,
+        async embed(inputs) {
+          seen.push(...inputs);
+          return base.embed(inputs);
+        },
+      };
+      const indexer = new Indexer(store, embedder, indexerOptions(storage, async (id) => files[id]!));
 
-  it("слишком большое и длинное пропущено, но с причиной", async () => {
-    const big = await store.getPost(1, 4);
-    expect(big).toMatchObject({ mediaStatus: "skipped" });
-    expect(big!.mediaAnalysis?.note).toContain("MEDIA_MAX_MB");
-    expect((await store.getPost(1, 5))!.mediaAnalysis?.note).toContain("MEDIA_MAX_SECONDS");
-    expect(seen).toHaveLength(3);
-    expect(await store.mediaStats(["photo", "voice", "video_note", "video"])).toEqual({ done: 3, skipped: 2 });
-  });
+      expect(await indexer.runOnce()).toBe(7);
+      expect(await store.indexStats()).toMatchObject({ posts: 7, indexed: 7, pending: 0, failed: 0 });
 
-  it("расшифровка находится поиском и видна нейросети", async () => {
-    const indexer = new Indexer(store, fakeEmbedder(), 64);
-    while ((await indexer.runOnce()) > 0);
-    const context = { store, embedder: fakeEmbedder() };
+      for (const [messageId, original] of Object.entries(files)) {
+        const asset = await store.getMediaAsset(9001, Number(messageId));
+        expect(asset).toMatchObject({ storageStatus: "stored", embeddingStatus: "done" });
+        expect(objects.get(asset!.objectKey!)?.bytes).toEqual(original);
+      }
 
-    const byWords = (await callTool("search_posts", { query: "фонтана", mode: "keyword" }, context)) as any;
-    expect(byWords.results[0]).toMatchObject({ message_id: 1 });
-    expect(byWords.results[0].media).toMatchObject({ type: "voice", transcript: "Договорились встретиться в четверг у фонтана" });
+      const chunkRows = await db.query<{
+        messageId: number;
+        kind: string;
+        startSeconds: number | null;
+        endSeconds: number | null;
+        content: string | null;
+      }>(
+        `SELECT message_id AS "messageId", kind, start_seconds AS "startSeconds",
+           end_seconds AS "endSeconds", content FROM chunks ORDER BY message_id, chunk_index`,
+      );
+      expect(chunkRows.some((row) => row.messageId === 1 && row.kind === "audio")).toBe(true);
+      expect(chunkRows.some((row) => row.messageId === 2 && row.kind === "image")).toBe(true);
+      expect(chunkRows.filter((row) => row.messageId === 3 && row.kind === "video").length).toBeGreaterThan(1);
+      expect(chunkRows.filter((row) => row.messageId === 3 && row.kind === "video").every((row) => row.content === null)).toBe(true);
+      expect(chunkRows.filter((row) => row.messageId === 3 && row.kind === "video").some((row) => row.startSeconds === 0 && row.endSeconds === 1)).toBe(true);
 
-    const bySense = (await callTool("search_posts", { query: "встреча в четверг у фонтана", mode: "semantic" }, context)) as any;
-    expect(bySense.results[0].message_id).toBe(1);
+      const videoInput = seen.find((input) => input.type === "multimodal" && input.parts.some((part) => part.type === "text" && part.text.includes("Звук и изображение")));
+      expect(videoInput?.type).toBe("multimodal");
+      if (videoInput?.type === "multimodal") expect(videoInput.parts.map((part) => part.type)).toContain("audio");
+      const silentInput = seen.find((input) => input.type === "multimodal" && input.parts.some((part) => part.type === "text" && part.text.includes("Немое видео")));
+      expect(silentInput?.type).toBe("multimodal");
+      if (silentInput?.type === "multimodal") expect(silentInput.parts.map((part) => part.type)).not.toContain("audio");
+      const imageInput = seen.find((input) => input.type === "multimodal" && input.parts.some((part) => part.type === "image"));
+      const imagePart = imageInput?.type === "multimodal" ? imageInput.parts.find((part) => part.type === "image") : undefined;
+      expect(imagePart?.type).toBe("image");
+      if (imagePart?.type === "image") expect(Buffer.from(imagePart.data)).toEqual(photo);
 
-    const post = (await callTool("get_post", { link: "https://t.me/ch/3" }, context)) as any;
-    expect(post.media).toMatchObject({ type: "photo", description: "Закат над морем", text_on_image: "ПЯТНИЦА" });
-    expect(post.media.fileId).toBeUndefined();
-  });
+      const post = await store.getPost(9001, 2);
+      const mediaMap = await presentPostMedia([post!], store, storage);
+      expect(mediaMap.get("9001:2")).toMatchObject({
+        url: expect.stringMatching(/^https:\/\/objects\.example\.test\/sha256\//),
+        mime_type: "image/png",
+        storage_status: "stored",
+      });
+      expect(mediaMap.get("9001:2")).not.toHaveProperty("transcript");
+      expect(mediaMap.get("9001:2")).not.toHaveProperty("description");
 
-  it("разобранное медиа переиндексирует пост; замена файла при правке — разбирает заново", async () => {
-    expect((await store.indexStats()).pending).toBe(0);
-    // правка подписи без замены файла — разбор остаётся
-    await store.upsertPosts([normalizeMessage(1, message(3, "Фото дня (правка)", { media: { className: "MessageMediaPhoto", photo: { id: { toString: () => "13" } } } }))]);
-    expect((await store.getPost(1, 3))!.mediaStatus).toBe("done");
-    // новый файл — разбор сброшен и встаёт в очередь
-    await store.upsertPosts([normalizeMessage(1, message(3, "Фото дня (правка)", { media: { className: "MessageMediaPhoto", photo: { id: { toString: () => "99" } } } }))]);
-    expect((await store.getPost(1, 3))!.mediaStatus).toBeNull();
-    expect((await store.pendingMedia(["photo"], undefined, 10)).map((j) => j.messageId)).toEqual([3]);
-  });
+      const [legacy] = await db.query<{ mediaText: string | null; mediaAnalysis: unknown }>(
+        `SELECT media_text AS "mediaText", media_analysis AS "mediaAnalysis" FROM posts WHERE channel_id = 9001 AND message_id = 1`,
+      );
+      expect(legacy?.mediaText).toBeNull();
+      expect(legacy?.mediaAnalysis).toBeNull();
+    } finally {
+      await db.close();
+    }
+  }, 30_000);
 
-  it("ошибка модели — failed, повтор по retry", async () => {
-    const failing = new MediaProcessor(
-      store,
-      { model: "x", analyze: async () => Promise.reject(new Error("429 rate limit")) },
-      async () => photo,
-      { types: ["photo"], maxBytes: 20 * 1_048_576, maxSeconds: 1800, concurrency: 1 },
-    );
-    await failing.runOnce();
-    expect((await store.getPost(1, 3))!.mediaStatus).toBe("failed");
-    expect(await failing.runOnce()).toBe(0);
-    await store.retryEmbedErrors();
-    expect((await store.pendingMedia(["photo"], undefined, 10))).toHaveLength(1);
-  });
+  it("keeps an uploaded original after embedding failure and retries from S3 without redownloading", async () => {
+    const { db, store } = await freshStore();
+    try {
+      await store.upsertChannel({ id: 9002, ref: "@retry", username: "retry", title: "Повтор", about: null, accessHash: "1" });
+      await store.upsertPosts([
+        normalizeMessage(9002, message(1, "Подпись голосового", { media: mediaFor("voice", 1, "audio/ogg", 2.4, "voice.ogg") })),
+      ]);
+      const { storage, objects } = makeStorage();
+      const base = fakeEmbedder();
+      let downloads = 0;
+      const options = indexerOptions(storage, async () => { downloads += 1; return voice; });
+      const failing: Embedder = {
+        model: base.model,
+        dimensions: base.dimensions,
+        modalities: base.modalities,
+        async embed(inputs) {
+          if (inputs.some((input) => input.type === "multimodal")) throw new Error("503 embedding unavailable");
+          return base.embed(inputs);
+        },
+      };
+      await new Indexer(store, failing, options).runOnce();
+      const saved = await store.getMediaAsset(9002, 1);
+      expect(saved).toMatchObject({ storageStatus: "stored", embeddingStatus: "failed" });
+      expect(objects.get(saved!.objectKey!)?.bytes).toEqual(voice);
+      expect(downloads).toBe(1);
 
-  it("MEDIA_SINCE отсекает историю", async () => {
-    expect(await store.pendingMedia(["photo"], new Date("2030-01-01"), 10)).toHaveLength(0);
-  });
+      await store.retryEmbedErrors();
+      await new Indexer(store, base, options).runOnce();
+      expect((await store.getMediaAsset(9002, 1))?.embeddingStatus).toBe("done");
+      expect(downloads).toBe(1);
+    } finally {
+      await db.close();
+    }
+  }, 30_000);
+
+  it("archives media the model cannot embed, skips only its vector and still indexes the post text", async () => {
+    const { db, store } = await freshStore();
+    try {
+      await store.upsertChannel({ id: 9004, ref: "@modal", username: "modal", title: "Модальности", about: null, accessHash: "1" });
+      await store.upsertPosts([
+        normalizeMessage(9004, message(1, "Фото кота", { media: mediaFor("photo", 2, "image/png", 0, "photo.png") })),
+        normalizeMessage(9004, message(2, "Голос про борщ", { media: mediaFor("voice", 1, "audio/ogg", 2.4, "voice.ogg") })),
+        normalizeMessage(9004, message(3, "Видео про хлеб", { media: mediaFor("video", 3, "video/mp4", 2.5, "video.mp4") })),
+        normalizeMessage(9004, message(4, "Анимация про чай", { media: mediaFor("gif", 5, "image/gif", 1.8, "animated.gif") })),
+      ]);
+      const { storage, objects } = makeStorage();
+      const seen: EmbeddingInput[] = [];
+      const base = fakeEmbedder(["image", "audio"]);
+      const embedder: Embedder = {
+        model: base.model,
+        dimensions: base.dimensions,
+        modalities: base.modalities,
+        async embed(inputs) {
+          seen.push(...inputs);
+          return base.embed(inputs);
+        },
+      };
+      const byMessage: Record<number, number> = { 1: 2, 2: 1, 3: 3, 4: 5 };
+      const indexer = new Indexer(store, embedder, indexerOptions(storage, async (id) => files[byMessage[id]!]!));
+
+      expect(await indexer.runOnce()).toBe(4);
+      expect(await store.indexStats()).toMatchObject({ posts: 4, indexed: 4, pending: 0, failed: 0 });
+
+      for (const messageId of [1, 2]) {
+        expect(await store.getMediaAsset(9004, messageId)).toMatchObject({ storageStatus: "stored", embeddingStatus: "done" });
+      }
+      for (const [messageId, original] of [[3, video], [4, gif]] as const) {
+        const asset = await store.getMediaAsset(9004, messageId);
+        expect(asset).toMatchObject({ storageStatus: "stored", embeddingStatus: "skipped" });
+        expect(asset?.embeddingError).toMatch(/не принимает video/);
+        expect(objects.get(asset!.objectKey!)?.bytes).toEqual(original);
+      }
+
+      const rows = await db.query<{ messageId: number; kind: string }>(
+        `SELECT message_id AS "messageId", kind FROM chunks ORDER BY message_id, chunk_index`,
+      );
+      expect(rows.filter((row) => row.kind === "video")).toEqual([]);
+      for (const messageId of [1, 2, 3, 4]) {
+        expect(rows.some((row) => row.messageId === messageId && row.kind === "text")).toBe(true);
+      }
+      expect(seen.some((input) => input.type === "multimodal" && input.parts.some((part) => part.type === "video"))).toBe(false);
+
+      const post = await store.getPost(9004, 3);
+      const mediaMap = await presentPostMedia([post!], store, storage);
+      expect(mediaMap.get("9004:3")).toMatchObject({
+        url: expect.stringMatching(/^https:\/\/objects\.example\.test\/sha256\//),
+        storage_status: "stored",
+      });
+    } finally {
+      await db.close();
+    }
+  }, 30_000);
+
+  it("archives media above the processing duration limit and reports an explicit embedding skip", async () => {
+    const { db, store } = await freshStore();
+    try {
+      await store.upsertChannel({ id: 9003, ref: "@limited", username: "limited", title: "Лимит", about: null, accessHash: "1" });
+      await store.upsertPosts([
+        normalizeMessage(9003, message(1, "Длинный ролик", { media: mediaFor("video", 3, "video/mp4", 2.5, "video.mp4") })),
+      ]);
+      const { storage, objects } = makeStorage();
+      const embedder = fakeEmbedder();
+      const indexer = new Indexer(
+        store,
+        embedder,
+        indexerOptions(storage, async () => video, { maxMediaSeconds: 1 }),
+      );
+
+      await indexer.runOnce();
+      const asset = await store.getMediaAsset(9003, 1);
+      expect(asset).toMatchObject({ storageStatus: "stored", embeddingStatus: "skipped" });
+      expect(objects.get(asset!.objectKey!)?.bytes).toEqual(video);
+      expect(await store.indexStats()).toMatchObject({ indexed: 1, pending: 0 });
+    } finally {
+      await db.close();
+    }
+  }, 30_000);
+
+  it("keeps the post text indexed when its attachment cannot be downloaded, and retries only the attachment", async () => {
+    const { db, store } = await freshStore();
+    try {
+      await store.upsertChannel({ id: 9005, ref: "@flood", username: "flood", title: "Флуд", about: null, accessHash: "1" });
+      await store.upsertPosts([
+        normalizeMessage(9005, message(1, "Подпись к фото кота", { media: mediaFor("photo", 2, "image/png", 0, "photo.png") })),
+      ]);
+      const { storage } = makeStorage();
+      let failing = true;
+      const options = indexerOptions(storage, async () => {
+        if (failing) throw new Error("FLOOD_WAIT_30");
+        return photo;
+      });
+      const embedder = fakeEmbedder();
+
+      await new Indexer(store, embedder, options).runOnce();
+
+      const [row] = await db.query<{ embedError: string | null; embeddedHash: string | null; indexHash: string }>(
+        `SELECT embed_error AS "embedError", embedded_hash AS "embeddedHash", index_hash AS "indexHash"
+         FROM posts WHERE channel_id = 9005`,
+      );
+      expect(row?.embedError).toBeNull();
+      expect(row?.embeddedHash).toBe(row?.indexHash);
+      expect(await db.query("SELECT kind FROM chunks WHERE channel_id = 9005")).toEqual([{ kind: "text" }]);
+      const failed = await store.getMediaAsset(9005, 1);
+      expect(failed).toMatchObject({ storageStatus: "failed" });
+      expect(failed?.storageError).toMatch(/FLOOD_WAIT_30/);
+      expect(await store.indexStats(options.mediaTypes)).toMatchObject({ failed: 1 });
+
+      failing = false;
+      await store.retryEmbedErrors();
+      await new Indexer(store, embedder, options).runOnce();
+      expect(await store.getMediaAsset(9005, 1)).toMatchObject({ storageStatus: "stored", embeddingStatus: "done" });
+      const kinds = await db.query<{ kind: string }>("SELECT kind FROM chunks WHERE channel_id = 9005 ORDER BY chunk_index");
+      expect(kinds.map((chunk) => chunk.kind)).toEqual(["text", "image"]);
+    } finally {
+      await db.close();
+    }
+  }, 30_000);
+
+  it("skips a file whose size reported by Telegram exceeds the limit without downloading it", async () => {
+    const { db, store } = await freshStore();
+    try {
+      await store.upsertChannel({ id: 9006, ref: "@huge", username: "huge", title: "Тяжёлый", about: null, accessHash: "1" });
+      await store.upsertPosts([
+        normalizeMessage(9006, message(1, "Огромный ролик", { media: mediaFor("video", 3, "video/mp4", 2.5, "video.mp4") })),
+      ]);
+      const { storage } = makeStorage();
+      let downloads = 0;
+      const options = indexerOptions(storage, async () => { downloads += 1; return video; }, { maxMediaBytes: 1024 });
+
+      await new Indexer(store, fakeEmbedder(), options).runOnce();
+
+      expect(downloads).toBe(0);
+      const asset = await store.getMediaAsset(9006, 1);
+      expect(asset).toMatchObject({ storageStatus: "skipped", embeddingStatus: "skipped" });
+      expect(asset?.storageError).toMatch(/MEDIA_MAX_MB/);
+      expect(await store.indexStats(options.mediaTypes)).toMatchObject({ indexed: 1, pending: 0, failed: 0 });
+      expect(await db.query("SELECT kind FROM chunks WHERE channel_id = 9006")).toEqual([{ kind: "text" }]);
+    } finally {
+      await db.close();
+    }
+  }, 30_000);
+
+  it("drops the vectors of a partially prepared attachment and keeps the skip reason", async () => {
+    const actual = await vi.importActual<typeof import("../src/media/prepare.ts")>("../src/media/prepare.ts");
+    prepareHook.override = async function* (...args: Parameters<typeof actual.prepareMediaChunks>) {
+      yield (await actual.prepareMediaChunks(...args).next()).value;
+      throw new Error("ffmpeg timed out");
+    };
+    const { db, store } = await freshStore();
+    try {
+      await store.upsertChannel({ id: 9007, ref: "@partial", username: "partial", title: "Частично", about: null, accessHash: "1" });
+      await store.upsertPosts([
+        normalizeMessage(9007, message(1, "Ролик, упавший на втором сегменте", { media: mediaFor("video", 3, "video/mp4", 2.5, "video.mp4") })),
+      ]);
+      const { storage } = makeStorage();
+      const options = indexerOptions(storage, async () => video);
+
+      await new Indexer(store, fakeEmbedder(), options).runOnce();
+
+      const asset = await store.getMediaAsset(9007, 1);
+      expect(asset).toMatchObject({ storageStatus: "stored", embeddingStatus: "skipped" });
+      expect(asset?.embeddingError).toMatch(/ffmpeg timed out/);
+      expect(await db.query("SELECT kind FROM chunks WHERE channel_id = 9007")).toEqual([{ kind: "text" }]);
+      expect(await store.indexStats(options.mediaTypes)).toMatchObject({ indexed: 1, pending: 0 });
+    } finally {
+      await db.close();
+    }
+  }, 30_000);
+
+  it("stops between segments, writes nothing and leaves the post in the queue", async () => {
+    const { db, store } = await freshStore();
+    try {
+      await store.upsertChannel({ id: 9008, ref: "@halt", username: "halt", title: "Остановка", about: null, accessHash: "1" });
+      await store.upsertPosts([
+        normalizeMessage(9008, message(1, "Видео, которое не успели доиндексировать", { media: mediaFor("video", 3, "video/mp4", 2.5, "video.mp4") })),
+      ]);
+      const { storage } = makeStorage();
+      const base = fakeEmbedder();
+      let multimodalCalls = 0;
+      let indexer!: Indexer;
+      const embedder: Embedder = {
+        model: base.model,
+        dimensions: base.dimensions,
+        modalities: base.modalities,
+        async embed(inputs) {
+          if (inputs.some((input) => input.type === "multimodal")) {
+            multimodalCalls += 1;
+            void indexer.stop();
+          }
+          return base.embed(inputs);
+        },
+      };
+      const options = indexerOptions(storage, async () => video);
+      indexer = new Indexer(store, embedder, options);
+
+      await indexer.runOnce();
+
+      expect(multimodalCalls).toBe(1);
+      expect(await db.query("SELECT 1 FROM chunks WHERE channel_id = 9008")).toHaveLength(0);
+      expect(await store.pendingForEmbedding(10, options.mediaTypes)).toHaveLength(1);
+      expect(await store.getMediaAsset(9008, 1)).toMatchObject({ storageStatus: "stored", embeddingStatus: "pending" });
+    } finally {
+      await db.close();
+    }
+  }, 30_000);
+
+  it("keeps measured file metadata when a stored attachment is re-indexed after a caption edit", async () => {
+    const { db, store } = await freshStore();
+    try {
+      await store.upsertChannel({ id: 9009, ref: "@edit", username: "edit", title: "Правка", about: null, accessHash: "1" });
+      const media = mediaFor("photo", 2, "image/png", 0, "photo.png");
+      await store.upsertPosts([normalizeMessage(9009, message(1, "Первая подпись", { media }))]);
+      const { storage } = makeStorage();
+      let downloads = 0;
+      const options = indexerOptions(storage, async () => { downloads += 1; return photo; });
+      const embedder = fakeEmbedder();
+      await new Indexer(store, embedder, options).runOnce();
+      const stored = await store.getMediaAsset(9009, 1);
+      expect(stored).toMatchObject({ mimeType: "image/png", storageStatus: "stored" });
+      expect(stored?.size).toBe(photo.byteLength);
+
+      await store.upsertPosts([normalizeMessage(9009, message(1, "Подпись после правки", { media }))]);
+      expect(await store.pendingForEmbedding(10, options.mediaTypes)).toHaveLength(1);
+      await new Indexer(store, embedder, options).runOnce();
+
+      expect(downloads).toBe(1);
+      expect(await store.getMediaAsset(9009, 1)).toMatchObject({
+        mimeType: stored!.mimeType,
+        fileName: stored!.fileName,
+        size: stored!.size,
+        embeddingStatus: "done",
+      });
+      const mediaMap = await presentPostMedia([(await store.getPost(9009, 1))!], store, storage);
+      expect(mediaMap.get("9009:1")).toMatchObject({ mime_type: "image/png" });
+    } finally {
+      await db.close();
+    }
+  }, 30_000);
+
+  it("removes the vectors of a replaced attachment even when the post cannot be re-indexed yet", async () => {
+    const { db, store } = await freshStore();
+    try {
+      await store.upsertChannel({ id: 9011, ref: "@swap", username: "swap", title: "Замена", about: null, accessHash: "1" });
+      await store.upsertPosts([
+        normalizeMessage(9011, message(1, "Фото, которое заменят", { media: mediaFor("photo", 2, "image/png", 0, "photo.png") })),
+      ]);
+      const { storage } = makeStorage();
+      const options = indexerOptions(storage, async () => photo);
+      const healthy = fakeEmbedder();
+      await new Indexer(store, healthy, options).runOnce();
+      const kindsOf = async () =>
+        (await db.query<{ kind: string }>("SELECT kind FROM chunks WHERE channel_id = 9011 ORDER BY chunk_index")).map((chunk) => chunk.kind);
+      expect(await kindsOf()).toEqual(["text", "image"]);
+
+      // Вложение подменили другим файлом, а сервис эмбеддингов недоступен.
+      await store.upsertPosts([
+        normalizeMessage(9011, message(1, "Фото, которое заменят", { media: mediaFor("photo", 7, "image/png", 0, "other.png") })),
+      ]);
+      const down: Embedder = {
+        model: healthy.model,
+        dimensions: healthy.dimensions,
+        modalities: healthy.modalities,
+        async embed() {
+          throw new Error("embedding service down");
+        },
+      };
+      await new Indexer(store, down, options).runOnce();
+
+      expect(await kindsOf()).toEqual(["text"]);
+    } finally {
+      await db.close();
+    }
+  }, 30_000);
+
+  it("rebuilds media vectors from S3 when Telegram is not connected", async () => {
+    const { db, store } = await freshStore();
+    try {
+      await store.upsertChannel({ id: 9010, ref: "@offline", username: "offline", title: "Без Telegram", about: null, accessHash: "1" });
+      await store.upsertPosts([
+        normalizeMessage(9010, message(1, "Фото при переиндексации", { media: mediaFor("photo", 2, "image/png", 0, "photo.png") })),
+      ]);
+      const { storage } = makeStorage();
+      let downloads = 0;
+      const options = indexerOptions(storage, async () => { downloads += 1; return photo; });
+      const embedder = fakeEmbedder();
+      await new Indexer(store, embedder, options).runOnce();
+
+      // Как после смены модели: векторы нужно построить заново.
+      await db.query("UPDATE posts SET embedded_hash = NULL WHERE channel_id = 9010");
+      const { downloadMedia: _telegram, ...withoutTelegram } = options;
+      await new Indexer(store, embedder, withoutTelegram).runOnce();
+
+      const kinds = await db.query<{ kind: string }>("SELECT kind FROM chunks WHERE channel_id = 9010 ORDER BY chunk_index");
+      expect(kinds.map((chunk) => chunk.kind)).toEqual(["text", "image"]);
+      expect(downloads).toBe(1);
+    } finally {
+      await db.close();
+    }
+  }, 30_000);
 });
+
+afterAll(() => rmSync(dir, { recursive: true, force: true }));

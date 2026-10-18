@@ -19,7 +19,7 @@ import type { Api, TelegramClient } from "teleproto";
 import { logger } from "../log.ts";
 import type { Channel, Store } from "../store.ts";
 import { type ResolvedChannel, resolveChannel } from "./client.ts";
-import { isPost, type MessageLike, normalizeMessage, type PostRecord } from "./normalize.ts";
+import { isPost, type MessageLike, normalizeMessage, type PostMedia, type PostRecord } from "./normalize.ts";
 
 const log = logger("telegram");
 
@@ -39,6 +39,9 @@ export class Ingestor {
   private pollTimer: NodeJS.Timeout | undefined;
   /** Каналы, по которым сейчас идёт чтение: второй проход не запускается поверх. */
   private readonly busy = new Set<number>();
+  private readonly syncTasks = new Set<Promise<void>>();
+  private readonly updateTasks = new Set<Promise<void>>();
+  private stopping = false;
 
   private readonly client: TelegramClient;
   private readonly store: Store;
@@ -56,12 +59,15 @@ export class Ingestor {
     log.info(`вошли как ${(me as Api.User).username ?? (me as Api.User).firstName ?? me.id}`);
 
     this.client.updates.on("deleteChannelMessages", async (update, next) => {
-      const channelId = Number(update.channelId.toString());
-      if (this.peers.has(channelId)) {
-        await this.store.markDeleted(channelId, update.messages);
-        log.info(`удалены посты ${channelId}: ${update.messages.join(", ")}`);
-      }
-      await next();
+      const task = (async () => {
+        const channelId = Number(update.channelId.toString());
+        if (this.peers.has(channelId)) {
+          await this.store.markDeleted(channelId, update.messages);
+          log.info(`удалены посты ${channelId}: ${update.messages.join(", ")}`);
+        }
+        await next();
+      })();
+      await this.track(task, this.updateTasks);
     });
     this.client.updates.catch((error) => log.error("ошибка обработки обновления", error));
 
@@ -79,9 +85,17 @@ export class Ingestor {
   }
 
   async stop(): Promise<void> {
+    this.stopping = true;
     clearInterval(this.pollTimer);
     this.stopWatch?.();
+    await Promise.allSettled([...this.syncTasks, ...this.updateTasks]);
     await this.client.disconnect();
+  }
+
+  private track(task: Promise<void>, active: Set<Promise<void>>): Promise<void> {
+    active.add(task);
+    void task.then(() => active.delete(task), () => active.delete(task));
+    return task;
   }
 
   /** Добавляет канал в пул и, если нужно, сразу начинает его читать. */
@@ -123,13 +137,18 @@ export class Ingestor {
     this.stopWatch?.();
     const peers = [...this.peers.values()].map((channel) => channel.peer);
     if (peers.length === 0) return;
-    this.stopWatch = this.client.updates.watch(peers, (update: any) => this.onUpdate(update), {
-      events: ["newChannelMessage", "editChannelMessage"],
-    });
+    this.stopWatch = this.client.updates.watch(
+      peers,
+      (update: any) => this.track(this.onUpdate(update), this.updateTasks),
+      {
+        events: ["newChannelMessage", "editChannelMessage"],
+      },
+    );
     log.info(`слежение за каналами: ${peers.length}`);
   }
 
   private async onUpdate(update: { message?: MessageLike & { peerId?: { channelId?: unknown } } }): Promise<void> {
+    if (this.stopping) return;
     const message = update.message;
     const channelId = Number(message?.peerId?.channelId?.toString());
     if (!message || !this.peers.has(channelId) || !isPost(message)) return;
@@ -138,25 +157,41 @@ export class Ingestor {
     this.options.onPosts?.();
   }
 
-  /** Файл медиа поста: сообщение перечитывается, ссылка на файл в нём свежая. */
-  async downloadMedia(channelId: number, messageId: number): Promise<Buffer> {
+  /** Файл медиа поста: сверяем, что Telegram ещё отдаёт исходный fileId. */
+  async downloadMedia(channelId: number, messageId: number, expected: PostMedia): Promise<Buffer> {
     const peer = this.peers.get(channelId)?.peer;
     if (!peer) throw new Error("канала нет в пуле");
     const [message] = (await this.client.getMessages(peer, { ids: messageId })) as unknown as Api.Message[];
     if (!message?.media) throw new Error("у сообщения больше нет медиа");
+    const current = normalizeMessage(channelId, message).media;
+    if (!current) throw new Error("у сообщения больше нет медиа");
+    if (expected.fileId ? current.fileId !== expected.fileId : !sameMediaIdentity(current, expected)) {
+      throw new Error("вложение в Telegram изменилось после постановки в очередь");
+    }
     const file = await this.client.downloadMedia(message, {});
     if (!file || typeof file === "string") throw new Error("файл не скачался");
     return Buffer.from(file);
   }
 
-  async syncAll(): Promise<void> {
+  syncAll(): Promise<void> {
+    if (this.stopping) return Promise.resolve();
+    return this.track(this.syncAllChannels(), this.syncTasks);
+  }
+
+  private async syncAllChannels(): Promise<void> {
     for (const channel of await this.store.listChannels()) {
+      if (this.stopping) return;
       await this.syncChannel(channel);
     }
   }
 
   /** История при первом проходе, дальше — всё новее последнего прочитанного. */
-  async syncChannel(channel: Channel): Promise<void> {
+  syncChannel(channel: Channel): Promise<void> {
+    if (this.stopping) return Promise.resolve();
+    return this.track(this.syncChannelWork(channel), this.syncTasks);
+  }
+
+  private async syncChannelWork(channel: Channel): Promise<void> {
     const peer = this.peers.get(channel.id)?.peer;
     if (!peer || this.busy.has(channel.id)) return;
     this.busy.add(channel.id);
@@ -181,7 +216,13 @@ export class Ingestor {
         ? this.client.iterMessages(peer, { limit: this.options.backfillLimit })
         : this.client.iterMessages(peer, { reverse: true, minId: channel.lastMessageId, limit: undefined, waitTime: 1 });
 
+      let interrupted = false;
       for await (const message of iterator as AsyncIterable<MessageLike>) {
+        // Остановка посреди длинной истории: сохраняем прочитанное, остальное дочитаем после запуска.
+        if (this.stopping) {
+          interrupted = true;
+          break;
+        }
         top = Math.max(top, message.id);
         if (isPost(message)) batch.push(normalizeMessage(channel.id, message));
         if (batch.length >= BATCH) {
@@ -190,6 +231,7 @@ export class Ingestor {
         }
       }
       await flush(!firstLimited);
+      if (interrupted) return;
 
       // Недавние посты — ещё раз: просмотры, реакции и правки, пропущенные вживую.
       if (channel.backfillDone) {
@@ -206,4 +248,12 @@ export class Ingestor {
       this.busy.delete(channel.id);
     }
   }
+}
+
+function sameMediaIdentity(left: PostMedia, right: PostMedia): boolean {
+  return left.type === right.type &&
+    left.fileName === right.fileName &&
+    left.mimeType === right.mimeType &&
+    left.size === right.size &&
+    left.duration === right.duration;
 }

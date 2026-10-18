@@ -165,13 +165,28 @@ function reactionLabel(reaction: any): string {
   return "?";
 }
 
-/** Текст, по которому строятся эмбеддинги и отпечаток поста. */
-export function searchableText(post: Pick<PostRecord, "text" | "media"> & { mediaText?: string | null }): string {
-  return [post.text, post.media?.searchText, post.mediaText].filter(Boolean).join("\n\n").trim();
+/** Исходный текст и метаданные Telegram; generated media analysis не включается. */
+export function searchableText(post: Pick<PostRecord, "text" | "media">): string {
+  return [post.text, post.media?.searchText].filter(Boolean).join("\n\n").trim();
 }
 
 export function hashContent(text: string): string {
   return createHash("sha256").update(text).digest("hex").slice(0, 32);
+}
+
+/** Stable attachment identity fallback for Telegram media without a file id. */
+export function mediaSourceFingerprint(media: PostMedia | null | undefined): string {
+  const identity = media
+    ? {
+        type: media.type,
+        fileId: media.fileId ?? null,
+        fileName: media.fileName ?? null,
+        mimeType: media.mimeType ?? null,
+        size: media.size ?? null,
+        duration: media.duration ?? null,
+      }
+    : null;
+  return createHash("sha256").update(JSON.stringify(identity)).digest("hex");
 }
 
 /** Служебные сообщения (закреп, смена названия…) постами не считаются. */

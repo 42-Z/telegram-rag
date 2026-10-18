@@ -5,6 +5,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
+import { collectMediaResourceLinks } from "./presentation.ts";
 import { TOOLS, ToolError, callTool, type ToolContext } from "./tools.ts";
 
 export const SERVER_NAME = "telegram-rag";
@@ -13,7 +14,8 @@ export const SERVER_VERSION = "0.1.0-beta";
 const INSTRUCTIONS =
   "База знаний по постам Telegram-каналов. Начни с list_channels, чтобы увидеть пул. " +
   "search_posts — поиск по смыслу и словам; list_posts — лента за период; get_post — пост целиком с альбомом " +
-  "и контекстом. Отвечая, ссылайся на посты по полю link.";
+  "и контекстом. Текст поста отдаётся вместе с прямыми временными ссылками на оригиналы медиа. " +
+  "Отвечая, ссылайся на посты по полю link.";
 
 export function createMcpServer(context: ToolContext): McpServer {
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION }, { instructions: INSTRUCTIONS });
@@ -29,7 +31,14 @@ export function createMcpServer(context: ToolContext): McpServer {
       async (args: unknown) => {
         try {
           const result = await callTool(tool.name, args, context);
-          return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+          const content = [
+            { type: "text" as const, text: JSON.stringify(result, null, 2) },
+            ...collectMediaResourceLinks(result),
+          ];
+          const structuredContent = result && typeof result === "object" && !Array.isArray(result)
+            ? result as Record<string, unknown>
+            : undefined;
+          return { content, structuredContent };
         } catch (error) {
           const message = error instanceof ToolError ? error.message : `внутренняя ошибка: ${String(error)}`;
           return { content: [{ type: "text" as const, text: message }], isError: true };

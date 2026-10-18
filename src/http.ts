@@ -117,7 +117,7 @@ export function createApp(options: AppOptions): Hono {
     c.json({
       ok: true,
       telegram: Boolean(ingestor),
-      index: await context.store.indexStats(),
+      index: await context.store.indexStats(options.mediaTypes ?? []),
       media: await context.store.mediaStats(options.mediaTypes ?? []),
     }),
   );
@@ -178,7 +178,7 @@ export function createApp(options: AppOptions): Hono {
   app.get("/api/admin/channels", adminAuth, async (c) =>
     c.json({
       channels: await context.store.listChannels({ includeDisabled: true }),
-      index: await context.store.indexStats(),
+      index: await context.store.indexStats(options.mediaTypes ?? []),
       media: await context.store.mediaStats(options.mediaTypes ?? []),
     }),
   );

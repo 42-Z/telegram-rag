@@ -9,7 +9,7 @@ FROM node:24-slim
 
 ENV NODE_ENV=production
 
-# ffmpeg: звук голосовых и кружков → mp3, кадры из видео — для разбора медиа.
+# ffmpeg/ffprobe: проверка формата и длительности, подготовка image/audio/video сегментов.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
