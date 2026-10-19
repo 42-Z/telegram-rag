@@ -26,7 +26,7 @@ export function createMcpServer(context: ToolContext): McpServer {
         title: tool.title,
         description: tool.description,
         inputSchema: tool.input.shape,
-        annotations: { readOnlyHint: true, openWorldHint: false },
+        annotations: { readOnlyHint: tool.readOnly ?? true, openWorldHint: false },
       },
       async (args: unknown) => {
         try {

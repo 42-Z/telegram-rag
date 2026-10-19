@@ -6,6 +6,7 @@
 import { isIP } from "node:net";
 import { z } from "zod";
 import { MODALITIES, type EmbeddingApi, type Modality } from "./embeddings.ts";
+import { MEDIA_ARCHIVE_MAX_BYTES, MEDIA_EMBED_MAX_BYTES, MEDIA_EMBED_MAX_SECONDS } from "./media/limits.ts";
 
 const optional = z
   .string()
@@ -126,8 +127,14 @@ const schema = z.object({
   MEDIA_TYPES: optional,
   /** Архивировать все медиа; мультимодальные векторы строятся только после этой даты. */
   MEDIA_SINCE: optional,
-  MEDIA_MAX_MB: z.coerce.number().positive().default(20),
-  MEDIA_MAX_SECONDS: z.coerce.number().int().positive().default(1800),
+  /**
+   * Устарели: пределы зафиксированы в `src/media/limits.ts` (2048 МиБ по
+   * прямому запросу, 100 МиБ для фоновой индексации и векторного поиска,
+   * 1800 секунд). Значения отвергаются, чтобы старый `.env` не менял
+   * поведение молча.
+   */
+  MEDIA_MAX_MB: optional,
+  MEDIA_MAX_SECONDS: optional,
   MEDIA_CONCURRENCY: z.coerce.number().int().min(1).max(16).default(2),
   MEDIA_SEGMENT_SECONDS: z.coerce.number().int().min(1).max(120).default(60),
   MEDIA_SEGMENT_OVERLAP_SECONDS: z.coerce.number().int().min(0).max(119).default(5),
@@ -199,6 +206,15 @@ const schema = z.object({
       path: ["MEDIA_TYPES"],
       message: "MEDIA_TYPES is no longer used: all media is stored in S3, and vectors are built for the types the model accepts (EMBEDDING_MODALITIES). Remove it",
     });
+  }
+  for (const key of ["MEDIA_MAX_MB", "MEDIA_MAX_SECONDS"] as const) {
+    if (config[key] !== undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: [key],
+        message: `${key} is no longer configurable: originals are archived up to ${MEDIA_ARCHIVE_MAX_BYTES / 1_048_576} MiB, vector search accepts up to ${MEDIA_EMBED_MAX_BYTES / 1_048_576} MiB and ${MEDIA_EMBED_MAX_SECONDS} seconds. Remove it`,
+      });
+    }
   }
   if (config.MEDIA_SEGMENT_OVERLAP_SECONDS >= config.MEDIA_SEGMENT_SECONDS) {
     ctx.addIssue({

@@ -78,8 +78,9 @@ describe("сервис через драйвер pg", async () => {
       batchSize: 64,
       concurrency: 1,
       mediaTypes: [],
-      maxMediaBytes: 20 * 1_048_576,
-      maxMediaSeconds: 1800,
+      maxArchiveBytes: 20 * 1_048_576,
+      maxEmbedBytes: 20 * 1_048_576,
+      maxEmbedSeconds: 1800,
       segmentSeconds: 60,
       segmentOverlapSeconds: 5,
     });

@@ -7,6 +7,7 @@ import { createEmbedder } from "./embeddings.ts";
 import { createApp } from "./http.ts";
 import { Indexer } from "./indexer.ts";
 import { logger, setLogLevel } from "./log.ts";
+import { MEDIA_ARCHIVE_MAX_BYTES, MEDIA_EMBED_MAX_BYTES, MEDIA_EMBED_MAX_SECONDS } from "./media/limits.ts";
 import { MEDIA_TYPES, mediaModality } from "./media/prepare.ts";
 import { createObjectStorage } from "./storage.ts";
 import { Store } from "./store.ts";
@@ -29,8 +30,9 @@ try {
       mediaSince: config.MEDIA_SINCE ?? null,
       segmentSeconds: config.MEDIA_SEGMENT_SECONDS,
       segmentOverlapSeconds: config.MEDIA_SEGMENT_OVERLAP_SECONDS,
-      maxMediaSeconds: config.MEDIA_MAX_SECONDS,
-      maxMediaMb: config.MEDIA_MAX_MB,
+      maxArchiveMb: MEDIA_ARCHIVE_MAX_BYTES / 1_048_576,
+      maxEmbedMb: MEDIA_EMBED_MAX_BYTES / 1_048_576,
+      maxEmbedSeconds: MEDIA_EMBED_MAX_SECONDS,
     }),
   });
 } catch (error) {
@@ -93,13 +95,19 @@ indexer = new Indexer(store, embedder, {
   // иначе переиндексация без Telegram стёрла бы векторы медиа.
   mediaTypes: MEDIA_TYPES,
   mediaSince: config.mediaSince,
-  maxMediaBytes: config.MEDIA_MAX_MB * 1_048_576,
-  maxMediaSeconds: config.MEDIA_MAX_SECONDS,
+  maxArchiveBytes: MEDIA_ARCHIVE_MAX_BYTES,
+  maxEmbedBytes: MEDIA_EMBED_MAX_BYTES,
+  maxEmbedSeconds: MEDIA_EMBED_MAX_SECONDS,
   segmentSeconds: config.MEDIA_SEGMENT_SECONDS,
   segmentOverlapSeconds: config.MEDIA_SEGMENT_OVERLAP_SECONDS,
   storage,
   ...(source
-    ? { downloadMedia: (channelId, messageId, expected) => source.downloadMedia(channelId, messageId, expected) }
+    ? {
+        downloadMedia: (channelId: number, messageId: number, expected) =>
+          source.downloadMedia(channelId, messageId, expected),
+        downloadMediaToFile: (channelId: number, messageId: number, expected, path: string) =>
+          source.downloadMediaToFile(channelId, messageId, expected, path),
+      }
     : {}),
 });
 if (source) {
@@ -117,7 +125,13 @@ if (ingestor) {
 }
 
 const app = createApp({
-  context: { store, embedder, storage, mediaTypes: MEDIA_TYPES },
+  context: {
+    store,
+    embedder,
+    storage,
+    mediaTypes: MEDIA_TYPES,
+    ensureMedia: (post) => indexer!.ensureOriginal(post),
+  },
   mediaTypes: MEDIA_TYPES,
   ingestor,
   apiToken: config.API_TOKEN,

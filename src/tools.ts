@@ -22,12 +22,16 @@ export interface ToolContext {
   embedder: Embedder;
   storage?: ObjectStorage;
   mediaTypes?: readonly string[];
+  /** Догружает оригинал вложения по явному запросу (до 2048 МиБ). */
+  ensureMedia?: (post: Post) => Promise<void>;
 }
 
 export interface ToolDef<S extends z.ZodObject = z.ZodObject> {
   name: string;
   title: string;
   description: string;
+  /** По умолчанию инструмент только читает; get_post может догрузить оригинал. */
+  readOnly?: boolean;
   input: S;
   run(args: z.infer<S>, context: ToolContext): Promise<unknown>;
 }
@@ -234,14 +238,16 @@ export const TOOLS: ToolDef[] = [
     title: "Пост целиком",
     description:
       "Один пост полностью по ссылке t.me/<канал>/<id> или по каналу и номеру сообщения: исходный текст, прямые " +
-      "ссылки на сохранённые вложения, все части альбома, пост, на который он отвечает, и соседние посты канала.",
+      "ссылки на сохранённые вложения, все части альбома, пост, на который он отвечает, и соседние посты канала. " +
+      "Недостающие оригиналы догружает из Telegram.",
+    readOnly: false,
     input: z.object({
       link: z.string().optional().describe("Ссылка вида https://t.me/<канал>/<id> или https://t.me/c/<id>/<id>"),
       channel: z.string().optional().describe("@имя, ссылка или id канала — если нет ссылки"),
       message_id: z.number().int().optional().describe("Номер сообщения в канале — если нет ссылки"),
       context: z.number().int().min(0).max(10).optional().describe("Сколько соседних постов до и после добавить, по умолчанию 0"),
     }),
-    async run(args, { store, storage }) {
+    async run(args, { store, storage, ensureMedia }) {
       let channelRef = args.channel;
       let messageId = args.message_id;
       if (args.link) {
@@ -268,6 +274,13 @@ export const TOOLS: ToolDef[] = [
         before = (await around("newest", { to: new Date(post.date) })).reverse();
         after = await around("oldest", { from: new Date(post.date) });
       }
+      // Прямой запрос по ссылке догружает оригиналы самого поста и альбома,
+      // не дожидаясь очереди; соседние посты остаются как есть.
+      if (ensureMedia) {
+        const requested = new Map([post, ...album].map((item) => [postKey(item), item]));
+        for (const item of requested.values()) await ensureMedia(item);
+      }
+
       const allPosts = [post, ...album, ...(replyTo ? [replyTo] : []), ...before, ...after];
       const media = await presentPostMedia(allPosts, store, storage);
       const extra: Record<string, unknown> = {};

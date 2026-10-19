@@ -73,6 +73,11 @@ describe("S3 configuration", () => {
     expect(loadConfig({ ...validEnv, MEDIA_TYPES: "" }).embedding.modalities).toEqual(["image", "audio", "video"]);
   });
 
+  it("rejects the retired media limits instead of silently applying them", () => {
+    expect(() => loadConfig({ ...validEnv, MEDIA_MAX_MB: "20" })).toThrow(/MEDIA_MAX_MB is no longer configurable/);
+    expect(() => loadConfig({ ...validEnv, MEDIA_MAX_SECONDS: "1800" })).toThrow(/MEDIA_MAX_SECONDS is no longer configurable/);
+  });
+
   it("rejects malformed endpoints and invalid URL TTLs", () => {
     expect(() => loadConfig({ ...validEnv, S3_ENDPOINT: "ftp://objects.example.test" })).toThrow();
     expect(() => loadConfig({ ...validEnv, S3_URL_TTL_SECONDS: "0" })).toThrow();

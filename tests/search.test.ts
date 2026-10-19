@@ -14,8 +14,9 @@ describe("semantic search after an edit", () => {
         batchSize: 10,
         concurrency: 1,
         mediaTypes: [],
-        maxMediaBytes: 1,
-        maxMediaSeconds: 1,
+        maxArchiveBytes: 1,
+        maxEmbedBytes: 1,
+        maxEmbedSeconds: 1,
         segmentSeconds: 1,
         segmentOverlapSeconds: 0,
       }).runOnce();
