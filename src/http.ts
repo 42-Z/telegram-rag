@@ -67,7 +67,7 @@ export function openApiDocument(baseUrl: string) {
     info: {
       title: "telegram-rag",
       version: SERVER_VERSION,
-      description: "Посты Telegram-каналов: пул с поиском и лентой, любой публичный канал по запросу.",
+      description: "Посты Telegram-каналов: поиск по пулу, лента любого публичного канала, пост целиком.",
     },
     servers: [{ url: baseUrl }],
     components: { securitySchemes: { bearer: { type: "http", scheme: "bearer" } } },

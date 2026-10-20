@@ -13,7 +13,7 @@ import type { Embedder } from "./embeddings.ts";
 import { logger } from "./log.ts";
 import { postKey, presentPost, presentPostMedia } from "./presentation.ts";
 import type { ObjectStorage } from "./storage.ts";
-import type { Channel, Post, PostFilter, SearchHit, Store } from "./store.ts";
+import type { Post, PostFilter, SearchHit, Store } from "./store.ts";
 import type { GuestReader } from "./telegram/reader.ts";
 
 const log = logger("tools");
@@ -33,7 +33,7 @@ export interface ToolDef<S extends z.ZodObject = z.ZodObject> {
   name: string;
   title: string;
   description: string;
-  /** По умолчанию инструмент только читает; get_post и read_channel пишут кэш и ходят в Telegram. */
+  /** По умолчанию инструмент только читает; get_post и list_posts пишут кэш и ходят в Telegram. */
   readOnly?: boolean;
   input: S;
   run(args: z.infer<S>, context: ToolContext): Promise<unknown>;
@@ -71,7 +71,7 @@ async function buildFilter(
       const channel = await store.findChannel(ref);
       if (!channel) throw new ToolError(`канала «${ref}» нет в пуле; список — list_channels`);
       if (channel.expiresAt) {
-        throw new ToolError(`канал «${ref}» вне пула: поиск и общая лента его не видят — читайте через read_channel`);
+        throw new ToolError(`канал «${ref}» вне пула: поиск и общая лента его не видят — читайте через list_posts`);
       }
       if (!channel.enabled) throw new ToolError(`канал «${ref}» отключён от пула — поиск по нему не работает`);
       filter.channelIds.push(channel.id);
@@ -138,27 +138,20 @@ async function presentFeed(
   return {
     posts: collapsed.map((post) => presentAlbumAware(post, media)),
     minMessageId: allPosts.length > 0 ? Math.min(...allPosts.map((post) => post.messageId)) : undefined,
-    maxMessageId: allPosts.length > 0 ? Math.max(...allPosts.map((post) => post.messageId)) : undefined,
   };
 }
 
-function channelView(channel: Channel, pool: boolean) {
-  return {
-    id: channel.id,
-    title: channel.title,
-    username: channel.username ?? undefined,
-    link: channel.username ? `https://t.me/${channel.username}` : undefined,
-    about: channel.about ?? undefined,
-    pool,
-    searchable: pool,
-    cache_expires_at: channel.expiresAt ? iso(channel.expiresAt) : undefined,
+/** В ленте одного канала название и id канала в каждом посте — лишний повтор. */
+function withoutChannel(posts: ReadonlyArray<Record<string, unknown>>): Array<Record<string, unknown>> {
+  const strip = (post: Record<string, unknown>): Record<string, unknown> => {
+    const { channel: _channel, channel_username: _username, channel_id: _channelId, ...rest } = post;
+    if (Array.isArray(rest.album)) {
+      rest.album = rest.album.map((item) => strip(item as Record<string, unknown>));
+    }
+    return rest;
   };
+  return posts.map(strip);
 }
-
-const guestNotice = (channel: Channel) =>
-  "Канал вне пула: посты читаются из Telegram и живут во временном кэше; в поиске они не участвуют, " +
-  "вложения не архивируются." +
-  (channel.expiresAt ? ` Кэш удалится примерно ${iso(channel.expiresAt)}, если канал не читать.` : "");
 
 /** Ошибки Telegram для канала вне пула — понятный отказ инструмента, а не 500. */
 async function guestCall<T>(ref: string, work: () => Promise<T>): Promise<T> {
@@ -199,7 +192,7 @@ export const TOOLS: ToolDef[] = [
     description:
       "Список Telegram-каналов, за которыми следит сервис: название, @имя, описание, сколько постов сохранено и " +
       "проиндексировано, дата первого и последнего поста. Начни с этого, чтобы понять, какие знания доступны. " +
-      "Каналы вне пула здесь не перечисляются — их можно читать через read_channel.",
+      "Каналы вне пула здесь не перечисляются — их посты читает list_posts.",
     input: z.object({}),
     async run(_args, { store, mediaTypes }) {
       const channels = await store.channelStats(mediaTypes ?? []);
@@ -297,83 +290,6 @@ export const TOOLS: ToolDef[] = [
   }),
 
   define({
-    name: "read_channel",
-    title: "Посты любого публичного канала",
-    description:
-      "Лента постов любого публичного канала по @имени или ссылке t.me/<имя> — в том числе канала, которого нет " +
-      "в пуле. Посты идут от новых к старым. Для каналов пула работает так же, как list_posts по одному каналу, " +
-      "и их посты участвуют в поиске. Каналы вне пула читаются из Telegram во временный кэш: поиск по ним не " +
-      "работает, вложения не сохраняются, кэш сам удаляется через время. Перелистывание вглубь — before_message_id " +
-      "из next_before_message_id; добрать новее — after_message_id, дальше — next_after_message_id.",
-    readOnly: false,
-    input: z.object({
-      channel: z.string().min(1).describe("@имя или ссылка https://t.me/<имя>"),
-      limit: z.number().int().min(1).max(100).optional().describe("Сколько постов вернуть, по умолчанию 20"),
-      before_message_id: z
-        .number()
-        .int()
-        .positive()
-        .optional()
-        .describe("Только посты старше этого номера — для следующей страницы вглубь"),
-      after_message_id: z
-        .number()
-        .int()
-        .positive()
-        .optional()
-        .describe("Только посты новее этого номера — чтобы добрать новые"),
-    }),
-    async run(args, { store, storage, guests }) {
-      const limit = args.limit ?? 20;
-      const order = "newest" as const;
-      const channel = await store.findChannel(args.channel);
-
-      if (channel && !channel.enabled) {
-        throw new ToolError(`канал «${args.channel}» отключён: включите его в управлении или читайте другой публичный канал`);
-      }
-      if (channel && !channel.expiresAt) {
-        const { posts, total } = await store.listPosts({
-          channelIds: [channel.id],
-          beforeMessageId: args.before_message_id,
-          afterMessageId: args.after_message_id,
-          order,
-          limit,
-        });
-        const feed = await presentFeed(posts, store, storage);
-        return {
-          channel: channelView(channel, true),
-          source: "pool",
-          has_more: total > posts.length,
-          next_before_message_id: feed.minMessageId,
-          next_after_message_id: args.after_message_id !== undefined ? feed.maxMessageId : undefined,
-          posts: feed.posts,
-        };
-      }
-
-      if (!guests) {
-        throw new ToolError("Telegram не подключён: каналы вне пула прочитать нельзя, доступны только каналы пула");
-      }
-      const page = await guestCall(args.channel, () =>
-        guests.read(args.channel, {
-          limit,
-          beforeMessageId: args.before_message_id,
-          afterMessageId: args.after_message_id,
-          order,
-        }),
-      );
-      const feed = await presentFeed(page.posts, store, storage, { archived: false });
-      return {
-        channel: channelView(page.channel, false),
-        source: page.fromCache ? "cache" : "telegram",
-        notice: page.notice ?? guestNotice(page.channel),
-        has_more: page.hasMore,
-        next_before_message_id: feed.minMessageId ?? page.nextBeforeMessageId,
-        next_after_message_id: args.after_message_id !== undefined ? feed.maxMessageId : undefined,
-        posts: feed.posts,
-      };
-    },
-  }),
-
-  define({
     name: "get_post",
     title: "Пост целиком",
     description:
@@ -456,7 +372,6 @@ export const TOOLS: ToolDef[] = [
         searchable: false,
         source: result.fromCache ? "cache" : "telegram",
         cache_expires_at: iso(result.channel.expiresAt),
-        notice: result.notice ?? guestNotice(result.channel),
       };
       if (result.album.length > 1) {
         extra.album = result.album.map((item) => presentPost(item, media.get(postKey(item))));
@@ -471,28 +386,65 @@ export const TOOLS: ToolDef[] = [
 
   define({
     name: "list_posts",
-    title: "Лента постов",
+    title: "Посты канала",
     description:
-      "Посты подряд по времени — как лента канала: за период, по каналам, от новых к старым или наоборот, с " +
-      "перелистыванием через offset. Возвращает прямые ссылки на сохранённые медиа; альбомы показаны одним постом.",
+      "Посты одного канала по @имени, ссылке t.me/<имя> или id — от новых к старым. Работает и для каналов вне " +
+      "пула: они читаются из Telegram, живут во временном кэше, не участвуют в поиске, вложения не архивируются. " +
+      "Перелистывание вглубь — before_message_id, добрать новее — after_message_id.",
+    readOnly: false,
     input: z.object({
-      channels: channelsArg,
-      date_from: dateFromArg,
-      date_to: dateToArg,
-      order: z.enum(["newest", "oldest"]).optional().describe("newest (по умолчанию) или oldest"),
-      limit: z.number().int().min(1).max(100).optional().describe("Сколько постов, по умолчанию 20"),
-      offset: z.number().int().min(0).optional().describe("Пропустить столько постов — для следующей страницы"),
+      channel: z.string().min(1).describe("@имя, ссылка https://t.me/<имя> или id канала"),
+      limit: z.number().int().min(1).max(100).optional().describe("Сколько постов вернуть, по умолчанию 20"),
+      before_message_id: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Только посты старше этого номера — для следующей страницы вглубь"),
+      after_message_id: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Только посты новее этого номера — чтобы добрать новые"),
     }),
-    async run(args, { store, storage }) {
+    async run(args, { store, storage, guests }) {
       const limit = args.limit ?? 20;
-      const offset = args.offset ?? 0;
-      const filter = await buildFilter(store, args);
-      const { posts, total } = await store.listPosts({ ...filter, order: args.order ?? "newest", limit, offset });
+      const channel = await store.findChannel(args.channel);
+
+      if (channel && !channel.enabled) {
+        throw new ToolError(`канал «${args.channel}» отключён: включите его в управлении или читайте другой публичный канал`);
+      }
+
+      let posts: Post[];
+      let archived = true;
+      if (channel && !channel.expiresAt) {
+        posts = (await store.listPosts({
+          channelIds: [channel.id],
+          beforeMessageId: args.before_message_id,
+          afterMessageId: args.after_message_id,
+          order: "newest",
+          limit,
+        })).posts;
+      } else {
+        if (!guests) {
+          throw new ToolError("Telegram не подключён: каналы вне пула прочитать нельзя, доступны только каналы пула");
+        }
+        const page = await guestCall(args.channel, () =>
+          guests.read(args.channel, {
+            limit,
+            beforeMessageId: args.before_message_id,
+            afterMessageId: args.after_message_id,
+          }),
+        );
+        posts = page.posts;
+        archived = false;
+      }
+
+      const feed = await presentFeed(posts, store, storage, { archived });
       return {
-        total,
-        offset,
-        next_offset: offset + posts.length < total ? offset + posts.length : undefined,
-        posts: (await presentFeed(posts, store, storage)).posts,
+        posts: withoutChannel(feed.posts),
+        next_before_message_id: feed.minMessageId,
       };
     },
   }),

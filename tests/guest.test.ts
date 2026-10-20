@@ -106,18 +106,17 @@ describe("каналы вне пула", () => {
   });
 
   it("перелистывает вглубь и добирает новее", async () => {
-    const older = await call("read_channel", { channel: "@outside", before_message_id: 3, limit: 2 });
+    const older = await call("list_posts", { channel: "@outside", before_message_id: 3, limit: 2 });
     expect(older.status).toBe(200);
     expect(older.body.posts.map((post: any) => post.message_id)).toEqual([2, 1]);
-    expect(older.body.has_more).toBe(false);
     expect(older.body.next_before_message_id).toBe(1);
 
     const newer = await guest.read("@outside", { afterMessageId: 2, limit: 3 });
     expect(newer.posts.map((post) => post.messageId)).toEqual([5, 4, 3]);
 
-    const newerPage = await call("read_channel", { channel: "@outside", after_message_id: 2, limit: 3 });
+    const newerPage = await call("list_posts", { channel: "@outside", after_message_id: 2, limit: 3 });
     expect(newerPage.body.posts.map((post: any) => post.message_id)).toEqual([5, 4]);
-    expect(newerPage.body.next_after_message_id).toBe(5);
+    expect(newerPage.body.next_before_message_id).toBe(3);
 
     const range = await guest.read("@outside", { afterMessageId: 1, beforeMessageId: 5, limit: 10 });
     expect(range.posts.map((post) => post.messageId)).toEqual([4, 3, 2]);
@@ -150,14 +149,14 @@ describe("каналы вне пула", () => {
     expect(tool.body.after[0].message_id).toBe(5);
   });
 
-  it("read_channel отдаёт альбом одним постом и не выдаёт ссылки на несохранённые вложения", async () => {
-    const response = await call("read_channel", { channel: "https://t.me/outside", limit: 3 });
+  it("list_posts отдаёт альбом одним постом и не выдаёт ссылки на несохранённые вложения", async () => {
+    const response = await call("list_posts", { channel: "https://t.me/outside", limit: 3 });
     expect(response.status).toBe(200);
-    expect(response.body).toMatchObject({ source: "telegram", has_more: true });
-    expect(response.body.channel).toMatchObject({ username: "outside", pool: false, searchable: false });
-    expect(response.body.channel.cache_expires_at).toBeTruthy();
-    expect(response.body.notice).toContain("Канал вне пула");
     expect(response.body.posts.map((post: any) => post.message_id)).toEqual([5, 4]);
+    expect(response.body.posts[1].channel).toBeUndefined();
+    expect(response.body.posts[1].channel_username).toBeUndefined();
+    expect(response.body.notice).toBeUndefined();
+    expect(response.body.source).toBeUndefined();
     const album = response.body.posts[1];
     expect(album.album).toHaveLength(2);
     expect(album.media).toMatchObject({ type: "photo", archived: false });
@@ -166,11 +165,11 @@ describe("каналы вне пула", () => {
   });
 
   it("не вступает в закрытые каналы и понятно отказывает", async () => {
-    const invite = await call("read_channel", { channel: "https://t.me/+AbCdEf" });
+    const invite = await call("list_posts", { channel: "https://t.me/+AbCdEf" });
     expect(invite.status).toBe(400);
     expect(invite.body.error).toContain("только публичные каналы");
 
-    const missing = await call("read_channel", { channel: "@missing" });
+    const missing = await call("list_posts", { channel: "@missing" });
     expect(missing.status).toBe(400);
     expect(missing.body.error).toContain("не прочитан");
   });

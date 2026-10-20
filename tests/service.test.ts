@@ -134,32 +134,38 @@ describe("REST", () => {
     const { body } = await tool("search_posts", { query: "хлеб", channels: ["@tech"] });
     expect(body.results.every((r: any) => r.channel === "Tech News")).toBe(true);
 
-    const none = await tool("list_posts", { date_to: "2020-01-01" });
-    expect(none.body.total).toBe(0);
+    const none = await tool("search_posts", { query: "хлеб", date_to: "2020-01-01" });
+    expect(none.body.results).toHaveLength(0);
 
     const unknown = await tool("search_posts", { query: "x", channels: ["@nope"] });
     expect(unknown.status).toBe(400);
   });
 
-  it("list_posts сворачивает альбом и листается", async () => {
-    const { body } = await tool("list_posts", { channels: ["tech"], order: "oldest" });
-    expect(body.total).toBe(4);
+  it("list_posts отдаёт посты одного канала, сворачивает альбом и листается", async () => {
+    const { body } = await tool("list_posts", { channel: "@tech", limit: 100 });
     expect(body.posts).toHaveLength(3);
-    expect(body.posts[2]).toMatchObject({ text: "Фото с презентации процессоров" });
-    expect(body.posts[2].album).toHaveLength(2);
+    expect(body.posts[0]).toMatchObject({ message_id: 4 });
+    expect(body.posts[0].album).toHaveLength(2);
+    expect(body.posts[0].channel).toBeUndefined();
+    expect(body.posts[0].channel_username).toBeUndefined();
+    expect(body.posts[0].channel_id).toBeUndefined();
+    expect(body.posts[0].link).toBe("https://t.me/tech/4");
 
-    const page = await tool("list_posts", { limit: 2, offset: 0 });
-    expect(page.body.next_offset).toBe(2);
+    const first = await tool("list_posts", { channel: "@tech", limit: 1 });
+    expect(first.body.posts.map((post: any) => post.message_id)).toEqual([4]);
+    expect(first.body.next_before_message_id).toBe(3);
+
+    const older = await tool("list_posts", { channel: "@tech", limit: 10, before_message_id: 3 });
+    expect(older.body.posts.map((post: any) => post.message_id)).toEqual([2, 1]);
+    expect(older.body.next_before_message_id).toBe(1);
   });
 
-  it("read_channel читает канал пула без Telegram", async () => {
-    const { status, body } = await tool("read_channel", { channel: "@tech", limit: 3 });
+  it("list_posts читает канал пула без Telegram", async () => {
+    const { status, body } = await tool("list_posts", { channel: "@tech", limit: 3 });
     expect(status).toBe(200);
-    expect(body).toMatchObject({ source: "pool" });
-    expect(body.channel).toMatchObject({ username: "tech", pool: true, searchable: true });
     expect(body.posts.map((post: any) => post.message_id)).toEqual([4, 2]);
 
-    const outside = await tool("read_channel", { channel: "@durov", limit: 1 });
+    const outside = await tool("list_posts", { channel: "@durov", limit: 1 });
     expect(outside.status).toBe(400);
     expect(outside.body.error).toContain("Telegram не подключён");
   });
@@ -224,14 +230,14 @@ describe("REST", () => {
 describe("подключение любых моделей", () => {
   it("описания функций в трёх форматах", async () => {
     const openai = (await (await call("/api/tools")).json()) as any[];
-    expect(openai.map((t) => t.function.name)).toEqual(["list_channels", "search_posts", "read_channel", "get_post", "list_posts"]);
+    expect(openai.map((t) => t.function.name)).toEqual(["list_channels", "search_posts", "get_post", "list_posts"]);
     expect(openai[1].function.parameters).toMatchObject({ type: "object", required: ["query"] });
 
     const anthropic = (await (await call("/api/tools?format=anthropic")).json()) as any[];
     expect(anthropic[1].input_schema.properties.query.type).toBe("string");
 
     const gemini = (await (await call("/api/tools?format=gemini")).json()) as any[];
-    expect(gemini[0].functionDeclarations).toHaveLength(5);
+    expect(gemini[0].functionDeclarations).toHaveLength(4);
   });
 
   it("OpenAPI", async () => {
@@ -250,7 +256,7 @@ describe("подключение любых моделей", () => {
     await client.connect(transport);
 
     const { tools } = await client.listTools();
-    expect(tools.map((t) => t.name)).toEqual(["list_channels", "search_posts", "read_channel", "get_post", "list_posts"]);
+    expect(tools.map((t) => t.name)).toEqual(["list_channels", "search_posts", "get_post", "list_posts"]);
     expect(tools[1]!.annotations?.readOnlyHint).toBe(true);
 
     const result = (await client.callTool({ name: "search_posts", arguments: { query: "хлеб на закваске", limit: 2 } })) as any;
@@ -265,10 +271,10 @@ describe("подключение любых моделей", () => {
     expect(resource.uri).toMatch(/^https:\/\/objects\.example\.test\//);
     expect(media.structuredContent.media.url).toBe(resource.uri);
 
-    const channel = (await client.callTool({ name: "read_channel", arguments: { channel: "@tech", limit: 3 } })) as any;
+    const channel = (await client.callTool({ name: "list_posts", arguments: { channel: "@tech", limit: 3 } })) as any;
     const channelPayload = JSON.parse(channel.content[0].text);
-    expect(channelPayload).toMatchObject({ source: "pool" });
     expect(channelPayload.posts.map((post: any) => post.message_id)).toEqual([4, 2]);
+    expect(channelPayload.posts[0].channel).toBeUndefined();
 
     const error = (await client.callTool({ name: "get_post", arguments: { link: "мусор" } })) as any;
     expect(error.isError).toBe(true);
