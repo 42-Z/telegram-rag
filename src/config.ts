@@ -126,8 +126,6 @@ const schema = z.object({
   MEDIA_TYPES: optional,
   /** Архивировать все медиа; мультимодальные векторы строятся только после этой даты. */
   MEDIA_SINCE: optional,
-  MEDIA_MAX_MB: z.coerce.number().positive().default(20),
-  MEDIA_MAX_SECONDS: z.coerce.number().int().positive().default(1800),
   MEDIA_CONCURRENCY: z.coerce.number().int().min(1).max(16).default(2),
   MEDIA_SEGMENT_SECONDS: z.coerce.number().int().min(1).max(120).default(60),
   MEDIA_SEGMENT_OVERLAP_SECONDS: z.coerce.number().int().min(0).max(119).default(5),

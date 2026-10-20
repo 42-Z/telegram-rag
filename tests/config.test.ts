@@ -73,6 +73,12 @@ describe("S3 configuration", () => {
     expect(loadConfig({ ...validEnv, MEDIA_TYPES: "" }).embedding.modalities).toEqual(["image", "audio", "video"]);
   });
 
+  it("ignores the retired media limits so old VPS env files keep starting", () => {
+    const config = loadConfig({ ...validEnv, MEDIA_MAX_MB: "20", MEDIA_MAX_SECONDS: "1800" });
+    expect(config).not.toHaveProperty("MEDIA_MAX_MB");
+    expect(config).not.toHaveProperty("MEDIA_MAX_SECONDS");
+  });
+
   it("rejects malformed endpoints and invalid URL TTLs", () => {
     expect(() => loadConfig({ ...validEnv, S3_ENDPOINT: "ftp://objects.example.test" })).toThrow();
     expect(() => loadConfig({ ...validEnv, S3_URL_TTL_SECONDS: "0" })).toThrow();

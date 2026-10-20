@@ -6,6 +6,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { migrate } from "../src/db.ts";
 import { createApp } from "../src/http.ts";
@@ -23,6 +24,11 @@ const storage: ObjectStorage = {
     const sha256 = createHash("sha256").update(input.bytes).digest("hex");
     return { key: `sha256/${sha256}`, sha256, size: input.bytes.byteLength, contentType: input.contentType };
   },
+  async saveOriginalFile(input) {
+    const bytes = await readFile(input.path);
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    return { key: `sha256/${sha256}`, sha256, size: bytes.byteLength, contentType: input.contentType };
+  },
   async readOriginal() { return Buffer.from("photo-original"); },
   async signGet(key) {
     signedCount += 1;
@@ -34,8 +40,9 @@ const indexer = new Indexer(store, embedder, {
   batchSize: 64,
   concurrency: 1,
   mediaTypes: [],
-  maxMediaBytes: 20 * 1_048_576,
-  maxMediaSeconds: 1800,
+  maxArchiveBytes: 20 * 1_048_576,
+  maxEmbedBytes: 20 * 1_048_576,
+  maxEmbedSeconds: 1800,
   segmentSeconds: 60,
   segmentOverlapSeconds: 5,
 });
@@ -164,6 +171,29 @@ describe("REST", () => {
 
     const missing = await tool("get_post", { channel: "tech", message_id: 999 });
     expect(missing.status).toBe(400);
+  });
+
+  it("get_post догружает оригиналы самого поста и альбома", async () => {
+    const requested: number[] = [];
+    const withMedia = createApp({
+      context: {
+        store,
+        embedder,
+        storage,
+        ensureMedia: async (post) => { requested.push(post.messageId); },
+      },
+      apiToken: "secret",
+      publicUrl: "http://test",
+    });
+
+    const response = await withMedia.request("/api/tools/get_post", {
+      method: "POST",
+      headers: { authorization: "Bearer secret", "content-type": "application/json" },
+      body: JSON.stringify({ link: "https://t.me/tech/3" }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(requested).toEqual([3, 4]);
   });
 
   it("неверные аргументы — понятная ошибка", async () => {

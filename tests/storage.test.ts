@@ -1,6 +1,9 @@
 import { createHash } from "node:crypto";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { createObjectStorage, type ObjectStorage, type S3StorageConfig } from "../src/storage.ts";
 
@@ -170,6 +173,34 @@ describe("S3-compatible object storage", () => {
     const get = requests.find((request) => request.method === "GET");
     expect(new URL(get!.url, endpoint).pathname).toBe(`/${BUCKET}/${stored.key}`);
   });
+
+  it("streams an original from a file and keeps the same digest-only path", async () => {
+    const storage = makeStorage();
+    const dir = await mkdtemp(join(tmpdir(), "telegram-rag-storage-"));
+    const path = join(dir, "original.bin");
+    const original = Buffer.alloc(1_048_576 + 17, 0x5a);
+    await writeFile(path, original);
+    try {
+      const stored = await storage.saveOriginalFile({
+        path,
+        contentType: "video/mp4",
+        filename: "clip.mp4",
+      });
+
+      expect(stored).toEqual({
+        key: testKey(original),
+        sha256: createHash("sha256").update(original).digest("hex"),
+        size: original.byteLength,
+        contentType: "video/mp4",
+      });
+      const put = requests.find((request) => request.method === "PUT");
+      expect(put?.headers["content-length"]).toBe(String(original.byteLength));
+      expect(put?.headers["x-amz-meta-filename"]).toBe("clip.mp4");
+      expect(put?.body).toEqual(original);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 15_000);
 
   it("keeps filename metadata within the 2048-byte S3 limit and rejects overflow before PUT", async () => {
     const storage = makeStorage();

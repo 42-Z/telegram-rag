@@ -3,14 +3,18 @@
  * считает прямые текстовые/мультимодальные векторы и атомарно меняет индекс.
  */
 
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Embedder, EmbeddingInput } from "./embeddings.ts";
 import { chunkHeader, buildChunks } from "./chunks.ts";
 import { logger } from "./log.ts";
-import { inspectMedia, mediaFileName, mediaModality, prepareMediaChunks, sniffMimeType } from "./media/prepare.ts";
+import { formatMediaSize } from "./media/limits.ts";
+import { MEDIA_TYPES, inspectMedia, mediaFileName, mediaModality, prepareMediaChunks, sniffMimeType } from "./media/prepare.ts";
 import { type MediaProbe } from "./media/ffmpeg.ts";
 import type { PreparedMediaChunk } from "./media/prepare.ts";
 import type { ObjectStorage } from "./storage.ts";
-import type { IndexedChunk, MediaAsset, MediaAssetReference, MediaJob, Store } from "./store.ts";
+import type { IndexedChunk, MediaAsset, MediaAssetReference, MediaJob, Post, Store } from "./store.ts";
 import { mediaSourceFingerprint, searchableText } from "./telegram/normalize.ts";
 
 const log = logger("indexer");
@@ -21,12 +25,25 @@ export interface IndexerOptions {
   concurrency: number;
   mediaTypes: readonly string[];
   mediaSince?: Date;
-  maxMediaBytes: number;
-  maxMediaSeconds: number;
+  /**
+   * Предел оригинала по явному запросу `get_post`. Фоновая индексация
+   * ограничена `maxEmbedBytes`: более крупные файлы догружаются по запросу.
+   */
+  maxArchiveBytes: number;
+  /** Предел размера и длительности для фоновой индексации и векторного поиска. */
+  maxEmbedBytes: number;
+  maxEmbedSeconds: number;
   segmentSeconds: number;
   segmentOverlapSeconds: number;
   storage?: ObjectStorage;
   downloadMedia?: (channelId: number, messageId: number, expected: MediaJob["media"]) => Promise<Buffer>;
+  /** Потоковая загрузка в файл для оригиналов, которые нельзя держать в памяти целиком. */
+  downloadMediaToFile?: (
+    channelId: number,
+    messageId: number,
+    expected: MediaJob["media"],
+    path: string,
+  ) => Promise<void>;
 }
 
 interface SavedOriginal {
@@ -50,6 +67,7 @@ export class Indexer {
   private wake: (() => void) | undefined;
   private timer: NodeJS.Timeout | undefined;
   private loopPromise: Promise<void> | undefined;
+  private readonly originalTasks = new Map<string, Promise<SavedOriginal | undefined>>();
   private readonly store: Store;
   private readonly embedder: Embedder;
   private readonly options: IndexerOptions;
@@ -83,9 +101,27 @@ export class Indexer {
     return posts.length;
   }
 
-  private async saveOriginal(job: MediaJob): Promise<SavedOriginal | undefined> {
+  /**
+   * Один оригинал — одна загрузка в каждом режиме. Фоновая очередь и прямой
+   * запрос используют разные пределы, поэтому и ключи разные.
+   */
+  private saveOriginal(job: MediaJob, direct = false): Promise<SavedOriginal | undefined> {
+    const source = job.media.fileId ?? mediaSourceFingerprint(job.media);
+    const key = `${job.channelId}:${job.messageId}:${source}:${direct ? "direct" : "background"}`;
+    const running = this.originalTasks.get(key);
+    if (running) return running;
+    let task: Promise<SavedOriginal | undefined>;
+    task = this.saveOriginalWork(job, direct).finally(() => {
+      if (this.originalTasks.get(key) === task) this.originalTasks.delete(key);
+    });
+    this.originalTasks.set(key, task);
+    return task;
+  }
+
+  private async saveOriginalWork(job: MediaJob, direct: boolean): Promise<SavedOriginal | undefined> {
     const storage = this.options.storage;
     const download = this.options.downloadMedia;
+    const downloadToFile = this.options.downloadMediaToFile;
     if (!storage) throw new Error("S3 storage is required for media archival");
 
     let asset = await this.store.getMediaAsset(job.channelId, job.messageId);
@@ -114,12 +150,32 @@ export class Indexer {
       if (!asset.objectKey || asset.storageStatus !== "stored") {
         throw new Error("сохранённый оригинал потерял ссылку на объект в S3");
       }
+
+      // Оригинал выше предела поиска не читаем из S3: вектора у него всё равно не будет.
+      const storedSize = asset.size ?? job.media.size ?? 0;
+      if (storedSize > this.options.maxEmbedBytes) {
+        return {
+          asset,
+          bytes: Buffer.alloc(0),
+          info: undefined,
+          skipReason: this.tooLargeForEmbedding(storedSize),
+        };
+      }
+
       let bytes: Buffer;
       try {
         bytes = await storage.readOriginal(asset.objectKey);
       } catch (error) {
-        await this.store.markMediaStorageFailed(assetRef(job), String(error));
+        await this.store.markMediaStorageFailed(assetRef(job), String(error), { allowStored: true });
         throw new Error("не удалось прочитать ранее сохранённый оригинал из S3");
+      }
+      if (bytes.length > this.options.maxEmbedBytes) {
+        return {
+          asset,
+          bytes: Buffer.alloc(0),
+          info: undefined,
+          skipReason: this.tooLargeForEmbedding(bytes.length),
+        };
       }
       let info: SavedOriginal["info"];
       let skipReason: string | undefined;
@@ -133,52 +189,108 @@ export class Indexer {
 
     asset = await this.store.ensureMediaAsset(mediaAssetInput);
     if (!asset) return undefined; // сообщение успели изменить или удалить
-    if (!download) {
+    if (!download && !downloadToFile) {
       const reason = "оригинал отсутствует в S3, а Telegram сейчас не подключён";
       await this.store.markMediaStorageFailed(assetRef(job), reason);
       await this.store.markMediaEmbeddingSkipped(assetRef(job), reason);
       return { asset, bytes: Buffer.alloc(0), info: undefined, skipReason: reason };
     }
 
-    // Размер из Telegram известен до скачивания: гигабайтное видео не грузим в память.
+    // Фоновая очередь не скачивает то, что не попадёт в векторный поиск;
+    // явный запрос get_post допускает оригинал до предела архива.
+    const downloadLimit = direct ? this.options.maxArchiveBytes : this.options.maxEmbedBytes;
     const claimedSize = job.media.size;
-    if (claimedSize && claimedSize > this.options.maxMediaBytes) {
-      return this.skipOversized(job, asset, Buffer.alloc(0), claimedSize);
+    if (claimedSize && claimedSize > downloadLimit) {
+      return this.skipArchiveOversized(job, asset, claimedSize, downloadLimit, direct);
     }
 
-    const bytes = await download(job.channelId, job.messageId, job.media);
-    if (bytes.length === 0) throw new Error("Telegram отдал пустой файл");
-    if (bytes.length > this.options.maxMediaBytes) return this.skipOversized(job, asset, bytes, bytes.length);
-
-    let info: SavedOriginal["info"];
-    let skipReason: string | undefined;
+    let tempDir: string | undefined;
     try {
-      info = await inspectMedia(bytes, job.media);
-    } catch (error) {
-      skipReason = `не удалось прочитать медиа для индексации: ${error instanceof Error ? error.message : String(error)}`;
+      let bytes: Buffer | undefined;
+      let path: string | undefined;
+      if (downloadToFile) {
+        tempDir = await mkdtemp(join(tmpdir(), "telegram-rag-original-"));
+        path = join(tempDir, "original");
+        await downloadToFile(job.channelId, job.messageId, job.media, path);
+      } else {
+        bytes = await download!(job.channelId, job.messageId, job.media);
+      }
+
+      const size = path ? (await stat(path)).size : bytes!.length;
+      if (size === 0) throw new Error("Telegram отдал пустой файл");
+      if (size > downloadLimit) return this.skipArchiveOversized(job, asset, size, downloadLimit, direct);
+
+      if (size > this.options.maxEmbedBytes) {
+        // Крупный оригинал сохраняем потоком; MIME из Telegram достаточен,
+        // потому что в векторный поиск этот файл уже не попадёт.
+        const contentType = job.media.mimeType?.trim() || "application/octet-stream";
+        const fileName = mediaFileName(job.media, contentType, job.channelId, job.messageId);
+        const stored = path
+          ? await storage.saveOriginalFile({ path, contentType, filename: fileName })
+          : await storage.saveOriginal({ bytes: bytes!, contentType, filename: fileName });
+        const savedAsset = await this.store.saveMediaAssetFile(assetRef(job), {
+          bucket: storage.bucket,
+          objectKey: stored.key,
+          sha256: stored.sha256,
+          mimeType: stored.contentType,
+          fileName,
+          size: stored.size,
+          duration: job.media.duration,
+        });
+        if (!savedAsset) return undefined;
+        return {
+          asset: savedAsset,
+          bytes: Buffer.alloc(0),
+          info: undefined,
+          skipReason: this.tooLargeForEmbedding(size),
+        };
+      }
+
+      const data = bytes ?? (await readFile(path!));
+      let info: SavedOriginal["info"];
+      let skipReason: string | undefined;
+      try {
+        info = await inspectMedia(data, job.media);
+      } catch (error) {
+        skipReason = `не удалось прочитать медиа для индексации: ${error instanceof Error ? error.message : String(error)}`;
+      }
+      const contentType = info?.mimeType ?? sniffMimeType(data, job.media, EMPTY_PROBE);
+      const fileName = mediaFileName(job.media, contentType, job.channelId, job.messageId);
+      const stored = await storage.saveOriginal({ bytes: data, contentType, filename: fileName });
+      const savedAsset = await this.store.saveMediaAssetFile(assetRef(job), {
+        bucket: storage.bucket,
+        objectKey: stored.key,
+        sha256: stored.sha256,
+        mimeType: stored.contentType,
+        fileName,
+        size: stored.size,
+        duration: info?.duration ?? job.media.duration,
+      });
+      if (!savedAsset) return undefined; // не привязываем файл к уже изменённому сообщению
+      if (skipReason) await this.store.markMediaEmbeddingSkipped(assetRef(job), skipReason);
+      return { asset: savedAsset, bytes: data, info, skipReason };
+    } finally {
+      if (tempDir) await rm(tempDir, { recursive: true, force: true });
     }
-    const contentType = info?.mimeType ?? sniffMimeType(bytes, job.media, EMPTY_PROBE);
-    const fileName = mediaFileName(job.media, contentType, job.channelId, job.messageId);
-    const stored = await storage.saveOriginal({ bytes, contentType, filename: fileName });
-    const savedAsset = await this.store.saveMediaAssetFile(assetRef(job), {
-      bucket: storage.bucket,
-      objectKey: stored.key,
-      sha256: stored.sha256,
-      mimeType: stored.contentType,
-      fileName,
-      size: stored.size,
-      duration: info?.duration ?? job.media.duration,
-    });
-    if (!savedAsset) return undefined; // не привязываем файл к уже изменённому сообщению
-    if (skipReason) await this.store.markMediaEmbeddingSkipped(assetRef(job), skipReason);
-    return { asset: savedAsset, bytes, info, skipReason };
   }
 
-  private async skipOversized(job: MediaJob, asset: MediaAsset, bytes: Buffer, size: number): Promise<SavedOriginal> {
-    const reason = `файл ${(size / 1_048_576).toFixed(1)} МБ превышает MEDIA_MAX_MB`;
+  private tooLargeForEmbedding(size: number): string {
+    return `файл ${formatMediaSize(size)} больше предела векторного поиска (${formatMediaSize(this.options.maxEmbedBytes)})`;
+  }
+
+  private async skipArchiveOversized(
+    job: MediaJob,
+    asset: MediaAsset,
+    size: number,
+    limit: number,
+    direct: boolean,
+  ): Promise<SavedOriginal> {
+    const reason = direct
+      ? `файл ${formatMediaSize(size)} превышает предел сохранения (${formatMediaSize(limit)})`
+      : `файл ${formatMediaSize(size)} больше предела фоновой индексации (${formatMediaSize(limit)}); доступен по прямому запросу get_post`;
     await this.store.markMediaStorageSkipped(assetRef(job), reason);
     await this.store.markMediaEmbeddingSkipped(assetRef(job), reason);
-    return { asset, bytes, info: undefined, skipReason: reason };
+    return { asset, bytes: Buffer.alloc(0), info: undefined, skipReason: reason };
   }
 
   private async processPost(post: Awaited<ReturnType<Store["pendingForEmbedding"]>>[number]): Promise<void> {
@@ -201,23 +313,11 @@ export class Indexer {
       }
     }
 
-    let mediaSkipReason = original?.skipReason;
+    const mediaSkipReason = original && mediaJob
+      ? original.skipReason ?? this.embeddingSkipReason(mediaJob, original)
+      : undefined;
     if (mediaSkipReason && mediaJob) {
       await this.store.markMediaEmbeddingSkipped(assetRef(mediaJob), mediaSkipReason);
-    }
-    if (original && mediaJob && !mediaSkipReason) {
-      const modality = mediaModality(mediaJob.media.type);
-      const tooOld = this.options.mediaSince && new Date(post.date) < this.options.mediaSince;
-      const tooLong = (original.info?.duration ?? media?.duration ?? 0) > this.options.maxMediaSeconds;
-      if (!modality || !this.embedder.modalities.has(modality)) {
-        // Оригинал уже в S3 и отдаётся вместе с постом; вектора у такого вложения нет.
-        mediaSkipReason = `модель ${this.embedder.model} не принимает ${modality ?? mediaJob.media.type}`;
-      } else if (tooOld) {
-        mediaSkipReason = `дата раньше MEDIA_SINCE (${this.options.mediaSince!.toISOString()})`;
-      } else if (tooLong) {
-        mediaSkipReason = `длительность больше MEDIA_MAX_SECONDS (${this.options.maxMediaSeconds})`;
-      }
-      if (mediaSkipReason) await this.store.markMediaEmbeddingSkipped(assetRef(mediaJob), mediaSkipReason);
     }
 
     const text = searchableText(post);
@@ -236,6 +336,58 @@ export class Indexer {
     }
 
     await this.store.replaceChunks(post, chunks);
+  }
+
+  private embeddingSkipReason(job: MediaJob, original: SavedOriginal): string | undefined {
+    const modality = mediaModality(job.media.type);
+    if (!modality || !this.embedder.modalities.has(modality)) {
+      // Оригинал уже в S3 и отдаётся вместе с постом; вектора у такого вложения нет.
+      return `модель ${this.embedder.model} не принимает ${modality ?? job.media.type}`;
+    }
+    if (this.options.mediaSince && job.date < this.options.mediaSince) {
+      return `дата раньше MEDIA_SINCE (${this.options.mediaSince.toISOString()})`;
+    }
+    const size = original.asset.size ?? original.bytes.length;
+    if (size > this.options.maxEmbedBytes) return this.tooLargeForEmbedding(size);
+    const duration = original.info?.duration ?? job.media.duration ?? 0;
+    if (duration > this.options.maxEmbedSeconds) {
+      return `длительность ${duration} секунд больше предела векторного поиска (${this.options.maxEmbedSeconds} секунд)`;
+    }
+    return undefined;
+  }
+
+  /**
+   * Догружает оригинал поста по явному запросу, не дожидаясь очереди.
+   * Предел архива — 2048 МиБ; вектор появится позже, если вложение
+   * укладывается в предел векторного поиска.
+   */
+  async ensureOriginal(post: Post): Promise<void> {
+    const media = post.media;
+    if (!media || !MEDIA_TYPES.includes(media.type) || !this.options.storage) return;
+    if (!this.options.downloadMedia && !this.options.downloadMediaToFile) return;
+    const job: MediaJob = {
+      channelId: post.channelId,
+      messageId: post.messageId,
+      date: new Date(post.date),
+      text: post.text,
+      media,
+    };
+    try {
+      const asset = await this.store.getMediaAsset(post.channelId, post.messageId);
+      if (asset?.storageStatus === "stored") return;
+      const original = await this.saveOriginal(job, true);
+      if (!original) return;
+      const skipReason = original.skipReason ?? this.embeddingSkipReason(job, original);
+      if (skipReason) {
+        await this.store.markMediaEmbeddingSkipped(assetRef(job), skipReason);
+      } else {
+        // Оригинал появился у уже проиндексированного поста — будим очередь.
+        this.notify();
+      }
+    } catch (error) {
+      await this.store.markMediaStorageFailed(assetRef(job), String(error));
+      log.warn(`вложение ${post.channelId}/${post.messageId} не сохранено по прямому запросу`, error);
+    }
   }
 
   /**

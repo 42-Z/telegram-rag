@@ -159,6 +159,20 @@ export class Ingestor {
 
   /** Файл медиа поста: сверяем, что Telegram ещё отдаёт исходный fileId. */
   async downloadMedia(channelId: number, messageId: number, expected: PostMedia): Promise<Buffer> {
+    const message = await this.mediaMessage(channelId, messageId, expected);
+    const file = await this.client.downloadMedia(message, {});
+    if (!file || typeof file === "string") throw new Error("файл не скачался");
+    return Buffer.from(file);
+  }
+
+  /** То же, но с потоковой записью на диск: для оригиналов до 2048 МиБ. */
+  async downloadMediaToFile(channelId: number, messageId: number, expected: PostMedia, path: string): Promise<void> {
+    const message = await this.mediaMessage(channelId, messageId, expected);
+    const file = await this.client.downloadMedia(message, { outputFile: path });
+    if (typeof file !== "string") throw new Error("файл не скачался");
+  }
+
+  private async mediaMessage(channelId: number, messageId: number, expected: PostMedia): Promise<Api.Message> {
     const peer = this.peers.get(channelId)?.peer;
     if (!peer) throw new Error("канала нет в пуле");
     const [message] = (await this.client.getMessages(peer, { ids: messageId })) as unknown as Api.Message[];
@@ -168,9 +182,7 @@ export class Ingestor {
     if (expected.fileId ? current.fileId !== expected.fileId : !sameMediaIdentity(current, expected)) {
       throw new Error("вложение в Telegram изменилось после постановки в очередь");
     }
-    const file = await this.client.downloadMedia(message, {});
-    if (!file || typeof file === "string") throw new Error("файл не скачался");
-    return Buffer.from(file);
+    return message;
   }
 
   syncAll(): Promise<void> {

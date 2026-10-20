@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
@@ -8,7 +9,7 @@ import type { Embedder, EmbeddingInput } from "../src/embeddings.ts";
 import { Indexer, type IndexerOptions } from "../src/indexer.ts";
 import { presentPostMedia } from "../src/presentation.ts";
 import type { ObjectStorage, SaveOriginalInput, StoredOriginal } from "../src/storage.ts";
-import { normalizeMessage, type PostMedia } from "../src/telegram/normalize.ts";
+import { mediaSourceFingerprint, normalizeMessage, type PostMedia } from "../src/telegram/normalize.ts";
 import { fakeEmbedder, freshStore, message } from "./helpers.ts";
 
 // Подмена подготовки медиа нужна одному тесту: ffmpeg сложно заставить упасть на середине файла.
@@ -82,6 +83,13 @@ function makeStorage() {
       objects.set(key, { bytes, mimeType: input.contentType });
       return { key, sha256, size: bytes.byteLength, contentType: input.contentType };
     },
+    async saveOriginalFile(input) {
+      const bytes = readFileSync(input.path);
+      const sha256 = createHash("sha256").update(bytes).digest("hex");
+      const key = `sha256/${sha256}`;
+      objects.set(key, { bytes, mimeType: input.contentType });
+      return { key, sha256, size: bytes.byteLength, contentType: input.contentType };
+    },
     async readOriginal(key) {
       const object = objects.get(key);
       if (!object) throw new Error("missing test object");
@@ -104,8 +112,9 @@ function indexerOptions(
     batchSize: 64,
     concurrency: 2,
     mediaTypes: ["photo", "voice", "video_note", "audio", "video", "gif"],
-    maxMediaBytes: 20 * 1_048_576,
-    maxMediaSeconds: 1800,
+    maxArchiveBytes: 20 * 1_048_576,
+    maxEmbedBytes: 20 * 1_048_576,
+    maxEmbedSeconds: 1800,
     segmentSeconds: 1,
     segmentOverlapSeconds: 0.25,
     storage,
@@ -303,7 +312,7 @@ describe("direct media embedding pipeline", () => {
       const indexer = new Indexer(
         store,
         embedder,
-        indexerOptions(storage, async () => video, { maxMediaSeconds: 1 }),
+        indexerOptions(storage, async () => video, { maxEmbedSeconds: 1 }),
       );
 
       await indexer.runOnce();
@@ -365,16 +374,133 @@ describe("direct media embedding pipeline", () => {
       ]);
       const { storage } = makeStorage();
       let downloads = 0;
-      const options = indexerOptions(storage, async () => { downloads += 1; return video; }, { maxMediaBytes: 1024 });
+      const options = indexerOptions(storage, async () => { downloads += 1; return video; }, { maxEmbedBytes: 1024 });
 
       await new Indexer(store, fakeEmbedder(), options).runOnce();
 
       expect(downloads).toBe(0);
       const asset = await store.getMediaAsset(9006, 1);
       expect(asset).toMatchObject({ storageStatus: "skipped", embeddingStatus: "skipped" });
-      expect(asset?.storageError).toMatch(/MEDIA_MAX_MB/);
+      expect(asset?.storageError).toMatch(/фоновой индексации/);
       expect(await store.indexStats(options.mediaTypes)).toMatchObject({ indexed: 1, pending: 0, failed: 0 });
       expect(await db.query("SELECT kind FROM chunks WHERE channel_id = 9006")).toEqual([{ kind: "text" }]);
+    } finally {
+      await db.close();
+    }
+  }, 30_000);
+
+  it("archives a pending original on a direct request and returns its link", async () => {
+    const { db, store } = await freshStore();
+    try {
+      await store.upsertChannel({ id: 9012, ref: "@direct", username: "direct", title: "Прямой запрос", about: null, accessHash: "1" });
+      await store.upsertPosts([
+        normalizeMessage(9012, message(1, "Фото по ссылке", { media: mediaFor("photo", 2, "image/png", 0, "photo.png") })),
+      ]);
+      const { storage } = makeStorage();
+      const indexer = new Indexer(store, fakeEmbedder(), indexerOptions(storage, async () => photo));
+      const post = (await store.getPost(9012, 1))!;
+
+      await indexer.ensureOriginal(post);
+
+      expect(await store.getMediaAsset(9012, 1)).toMatchObject({
+        storageStatus: "stored",
+        embeddingStatus: "pending",
+      });
+      const media = await presentPostMedia([post], store, storage);
+      expect(media.get("9012:1")).toMatchObject({
+        url: expect.stringMatching(/^https:\/\/objects\.example\.test\/sha256\//),
+        storage_status: "stored",
+      });
+    } finally {
+      await db.close();
+    }
+  }, 30_000);
+
+  it("keeps a direct original above the vector limit out of search but available by link", async () => {
+    const { db, store } = await freshStore();
+    try {
+      await store.upsertChannel({ id: 9013, ref: "@large", username: "large", title: "Большой", about: null, accessHash: "1" });
+      await store.upsertPosts([
+        normalizeMessage(9013, message(1, "Фото больше лимита вектора", { media: mediaFor("photo", 2, "image/png", 0, "photo.png") })),
+      ]);
+      const { storage } = makeStorage();
+      const indexer = new Indexer(
+        store,
+        fakeEmbedder(),
+        indexerOptions(storage, async () => photo, { maxEmbedBytes: 1 }),
+      );
+      const post = (await store.getPost(9013, 1))!;
+
+      await indexer.ensureOriginal(post);
+
+      const asset = await store.getMediaAsset(9013, 1);
+      expect(asset).toMatchObject({ storageStatus: "stored", embeddingStatus: "skipped" });
+      expect(asset?.embeddingError).toMatch(/векторного поиска/);
+      expect(await db.query("SELECT kind FROM chunks WHERE channel_id = 9013")).toEqual([]);
+      const media = await presentPostMedia([post], store, storage);
+      expect(media.get("9013:1")).toMatchObject({
+        url: expect.stringMatching(/^https:\/\/objects\.example\.test\/sha256\//),
+        storage_status: "stored",
+      });
+    } finally {
+      await db.close();
+    }
+  }, 30_000);
+
+  it("streams the original through a temporary file when Telegram writes to disk", async () => {
+    const { db, store } = await freshStore();
+    try {
+      await store.upsertChannel({ id: 9014, ref: "@stream", username: "stream", title: "Поток", about: null, accessHash: "1" });
+      await store.upsertPosts([
+        normalizeMessage(9014, message(1, "Фото потоком", { media: mediaFor("photo", 2, "image/png", 0, "photo.png") })),
+      ]);
+      const { storage, objects } = makeStorage();
+      const options = {
+        ...indexerOptions(storage, async () => photo),
+        maxEmbedBytes: 1,
+        downloadMedia: undefined,
+        downloadMediaToFile: async (_channelId: number, _messageId: number, _expected: PostMedia, path: string) => {
+          await writeFile(path, photo);
+        },
+      };
+      const indexer = new Indexer(store, fakeEmbedder(), options);
+
+      await indexer.ensureOriginal((await store.getPost(9014, 1))!);
+
+      const asset = await store.getMediaAsset(9014, 1);
+      expect(asset).toMatchObject({ storageStatus: "stored", embeddingStatus: "skipped" });
+      expect(asset?.embeddingError).toMatch(/векторного поиска/);
+      expect(objects.get(asset!.objectKey!)?.bytes).toEqual(photo);
+    } finally {
+      await db.close();
+    }
+  }, 30_000);
+
+  it("does not let a late parallel failure overwrite a stored original", async () => {
+    const { db, store } = await freshStore();
+    try {
+      await store.upsertChannel({ id: 9015, ref: "@race", username: "race", title: "Гонка", about: null, accessHash: "1" });
+      await store.upsertPosts([
+        normalizeMessage(9015, message(1, "Фото при гонке", { media: mediaFor("photo", 2, "image/png", 0, "photo.png") })),
+      ]);
+      const { storage } = makeStorage();
+      await new Indexer(store, fakeEmbedder(), indexerOptions(storage, async () => photo)).runOnce();
+      const post = (await store.getPost(9015, 1))!;
+      const reference = {
+        channelId: 9015,
+        messageId: 1,
+        sourceFileId: post.media?.fileId,
+        sourceFingerprint: mediaSourceFingerprint(post.media),
+      };
+
+      await store.markMediaStorageFailed(reference, "late download failure");
+      expect(await store.getMediaAsset(9015, 1)).toMatchObject({ storageStatus: "stored" });
+
+      await store.markMediaStorageSkipped(reference, "late skip");
+      expect(await store.getMediaAsset(9015, 1)).toMatchObject({ storageStatus: "stored" });
+
+      await store.markMediaStorageFailed(reference, "stored object is unreadable", { allowStored: true });
+      expect(await store.getMediaAsset(9015, 1)).toMatchObject({ storageStatus: "failed" });
     } finally {
       await db.close();
     }

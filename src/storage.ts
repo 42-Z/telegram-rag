@@ -1,11 +1,14 @@
 import { createHash } from "node:crypto";
+import { createReadStream } from "node:fs";
+import { stat } from "node:fs/promises";
 import { GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { NodeHttpHandler } from "@smithy/node-http-handler";
 import type { AwsCredentialIdentity, AwsCredentialIdentityProvider } from "@smithy/types";
 
 const CONNECTION_TIMEOUT_MS = 5_000;
-const REQUEST_TIMEOUT_MS = 30_000;
+/** Простой соединения; общего requestTimeout нет — оригинал может идти дольше. */
+const SOCKET_TIMEOUT_MS = 120_000;
 const MAX_ATTEMPTS = 3;
 const OBJECT_KEY_PATTERN = /^sha256\/[a-f0-9]{64}$/;
 const FILENAME_METADATA_KEY = "filename";
@@ -27,6 +30,14 @@ export interface SaveOriginalInput {
   filename?: string;
 }
 
+export interface SaveOriginalFileInput {
+  /** Path to a complete, immutable file; it is hashed and uploaded as a stream. */
+  path: string;
+  contentType: string;
+  /** Stored as object metadata only; it never contributes to the object key. */
+  filename?: string;
+}
+
 export interface StoredOriginal {
   key: string;
   sha256: string;
@@ -43,6 +54,8 @@ export interface SignedGetUrl {
 export interface ObjectStorage {
   readonly bucket: string;
   saveOriginal(input: SaveOriginalInput): Promise<StoredOriginal>;
+  /** Streaming upload for originals that must not be loaded into memory whole. */
+  saveOriginalFile(input: SaveOriginalFileInput): Promise<StoredOriginal>;
   readOriginal(key: string): Promise<Buffer>;
   signGet(key: string): Promise<SignedGetUrl>;
   close(): Promise<void>;
@@ -71,19 +84,7 @@ class S3ObjectStorage implements ObjectStorage {
 
   async saveOriginal(input: SaveOriginalInput): Promise<StoredOriginal> {
     this.assertOpen();
-    if (!input.contentType || /[\r\n]/.test(input.contentType)) {
-      throw new TypeError("A valid content type is required");
-    }
-    if (input.filename !== undefined && /[\u0000-\u001f\u007f]/.test(input.filename)) {
-      throw new TypeError("Filename metadata cannot contain control characters");
-    }
-    const encodedFilename = input.filename === undefined ? undefined : encodeURIComponent(input.filename);
-    const filenameMetadataBytes = encodedFilename === undefined
-      ? 0
-      : Buffer.byteLength(FILENAME_METADATA_KEY, "utf8") + Buffer.byteLength(encodedFilename, "utf8");
-    if (filenameMetadataBytes > S3_USER_METADATA_MAX_BYTES) {
-      throw new TypeError(`Filename metadata exceeds S3's ${S3_USER_METADATA_MAX_BYTES}-byte user metadata limit`);
-    }
+    const encodedFilename = this.encodedFilename(input.contentType, input.filename);
 
     // Copy once so the digest, length, and bytes sent to S3 all describe the same snapshot.
     const bytes = Buffer.from(input.bytes);
@@ -104,6 +105,32 @@ class S3ObjectStorage implements ObjectStorage {
     );
 
     return { key, sha256, size: bytes.byteLength, contentType: input.contentType };
+  }
+
+  async saveOriginalFile(input: SaveOriginalFileInput): Promise<StoredOriginal> {
+    this.assertOpen();
+    const encodedFilename = this.encodedFilename(input.contentType, input.filename);
+    const size = (await stat(input.path)).size;
+
+    const hash = createHash("sha256");
+    for await (const chunk of createReadStream(input.path)) hash.update(chunk);
+    const sha256 = hash.digest("hex");
+    const key = `sha256/${sha256}`;
+
+    await this.client.send(
+      new PutObjectCommand({
+        Bucket: this.config.bucket,
+        Key: key,
+        Body: createReadStream(input.path),
+        ContentLength: size,
+        ContentType: input.contentType,
+        ...(encodedFilename === undefined
+          ? {}
+          : { Metadata: { [FILENAME_METADATA_KEY]: encodedFilename } }),
+      }),
+    );
+
+    return { key, sha256, size, contentType: input.contentType };
   }
 
   async readOriginal(key: string): Promise<Buffer> {
@@ -163,11 +190,16 @@ class S3ObjectStorage implements ObjectStorage {
       forcePathStyle: this.config.forcePathStyle,
       credentials,
       maxAttempts: MAX_ATTEMPTS,
+      // S3-compatible сервисы не обязаны понимать aws-chunked trailers; для
+      // потоковой загрузки достаточно Content-Length и TLS.
+      requestChecksumCalculation: "WHEN_REQUIRED",
+      responseChecksumValidation: "WHEN_REQUIRED",
       requestHandler: new NodeHttpHandler({
         connectionTimeout: CONNECTION_TIMEOUT_MS,
-        requestTimeout: REQUEST_TIMEOUT_MS,
-        socketTimeout: REQUEST_TIMEOUT_MS,
-        throwOnRequestTimeout: true,
+        // Большой оригинал передаётся минутами; общий таймаут оборвал бы его.
+        // Зависшее соединение ловит socketTimeout по отсутствию активности.
+        requestTimeout: 0,
+        socketTimeout: SOCKET_TIMEOUT_MS,
       }),
     });
   }
@@ -176,6 +208,23 @@ class S3ObjectStorage implements ObjectStorage {
     return typeof this.config.credentials === "function"
       ? this.config.credentials()
       : this.config.credentials;
+  }
+
+  private encodedFilename(contentType: string, filename: string | undefined): string | undefined {
+    if (!contentType || /[\r\n]/.test(contentType)) {
+      throw new TypeError("A valid content type is required");
+    }
+    if (filename !== undefined && /[\u0000-\u001f\u007f]/.test(filename)) {
+      throw new TypeError("Filename metadata cannot contain control characters");
+    }
+    const encodedFilename = filename === undefined ? undefined : encodeURIComponent(filename);
+    const filenameMetadataBytes = encodedFilename === undefined
+      ? 0
+      : Buffer.byteLength(FILENAME_METADATA_KEY, "utf8") + Buffer.byteLength(encodedFilename, "utf8");
+    if (filenameMetadataBytes > S3_USER_METADATA_MAX_BYTES) {
+      throw new TypeError(`Filename metadata exceeds S3's ${S3_USER_METADATA_MAX_BYTES}-byte user metadata limit`);
+    }
+    return encodedFilename;
   }
 
   private assertObjectKey(key: string): void {

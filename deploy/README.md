@@ -104,8 +104,6 @@ S3_SECRET_ACCESS_KEY=
 S3_FORCE_PATH_STYLE=true
 S3_URL_TTL_SECONDS=3600
 MEDIA_SINCE=
-MEDIA_MAX_MB=20
-MEDIA_MAX_SECONDS=1800
 MEDIA_SEGMENT_SECONDS=60
 MEDIA_SEGMENT_OVERLAP_SECONDS=5
 API_TOKEN=
@@ -113,6 +111,9 @@ ADMIN_TOKEN=
 PUBLIC_URL=https://telegram-rag.zomb.top
 EOF
 chmod 600 /etc/telegram-rag.env
+
+`MEDIA_MAX_MB` и `MEDIA_MAX_SECONDS` из старых установок можно удалить: сервис
+их игнорирует, запуск они не ломают.
 
 # 2. Переменные compose (не секреты).
 cat > .env <<'EOF'
