@@ -17,13 +17,13 @@
 1 196 032 байт, в среднем ≈ 16.6 КБ на пост, то есть 500 МБ ≈ 30 тысяч постов.
 У каналов с длинными постами кусков на пост больше.
 
-### Supabase — рекомендуется: команда им уже пользуется в Mimic42
+### Supabase — рекомендуется
 
 Бесплатно: база 500 МБ, 2 активных проекта на организацию, проект засыпает
 после недели бездействия (сервис пишет постоянно — это не про нас). Pro —
 $25 в месяц, 8 ГБ включено ([supabase.com/pricing](https://supabase.com/pricing)).
-Если оба бесплатных проекта организации уже заняты (например, Mimic42 prod и
-dev) — нужен Pro или отдельная организация.
+Если оба бесплатных проекта организации уже заняты — нужен Pro или отдельная
+организация.
 
 1. **New project**, регион поближе к VPS, пароль базы сохранить.
 2. **Connect → Session pooler** — скопировать строку, подставить пароль,
@@ -108,7 +108,7 @@ MEDIA_SEGMENT_SECONDS=60
 MEDIA_SEGMENT_OVERLAP_SECONDS=5
 API_TOKEN=
 ADMIN_TOKEN=
-PUBLIC_URL=https://telegram-rag.zomb.top
+PUBLIC_URL=
 EOF
 chmod 600 /etc/telegram-rag.env
 
@@ -155,7 +155,7 @@ Neon: строку `DATABASE_CA_CERT` из секретов убрать, overri
 - Secrets: `DEPLOY_SSH_KEY` (ed25519 без пароля), `DEPLOY_HOST`, `DEPLOY_USER`,
   `DEPLOY_KNOWN_HOSTS` (вывод `ssh-keyscan`, отпечаток сверить с консолью VPS).
 - Variables: `DEPLOY_PATH=/root/sites/telegram-rag`,
-  `PUBLIC_URL=https://telegram-rag.zomb.top`, `DEPLOY_PORT` — только если порт не 22.
+  `PUBLIC_URL=https://<домен>`, `DEPLOY_PORT` — только если порт не 22.
 - После первой сборки пакет `ghcr.io/42-z/telegram-rag` переключить в PUBLIC.
 
 ## Как проходит выкатка
@@ -174,8 +174,8 @@ merge заканчивался бы ошибкой выкатки. Когда в
 ## Проверка после выкатки
 
 ```bash
-curl -s https://telegram-rag.zomb.top/ | head -c 300                       # сводка адресов
-curl -s https://telegram-rag.zomb.top/api/admin/channels -H "Authorization: Bearer $ADMIN_TOKEN"
+curl -s https://<домен>/ | head -c 300                       # сводка адресов
+curl -s https://<домен>/api/admin/channels -H "Authorization: Bearer $ADMIN_TOKEN"
 docker compose logs --tail=100 app                                          # «вошли как …», «слежение за каналами: N»
 ```
 

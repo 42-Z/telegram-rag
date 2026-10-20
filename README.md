@@ -1,12 +1,72 @@
-# telegram-rag
+<div align="center">
 
-> **Бета.** Работает на живых каналах, но интерфейс инструментов и схема
-> базы ещё могут меняться. Выкатка на сервер — вручную.
+<h1>telegram-rag</h1>
 
-База знаний по Telegram-каналам для любых нейросетей. Сервис через userbot
-(teleproto) постоянно следит за пулом каналов, сохраняет каждый пост целиком,
-строит эмбеддинги и отдаёт посты ассистентам: через MCP, REST/OpenAPI и
-готовые описания функций для function calling.
+<p><strong>База знаний по Telegram-каналам для любых нейросетей</strong></p>
+
+<p>Userbot собирает посты целиком, сохраняет оригиналы вложений и отдаёт их через MCP, REST и OpenAPI — с гибридным поиском по смыслу и словам.</p>
+
+<p>
+  <a href="https://github.com/42-Z/telegram-rag/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/42-Z/telegram-rag/actions/workflows/ci.yml/badge.svg"></a>
+  <img alt="Node.js 24.12+" src="https://img.shields.io/badge/Node.js-%E2%89%A524.12-339933?logo=node.js&logoColor=white">
+  <img alt="MCP Streamable HTTP" src="https://img.shields.io/badge/MCP-Streamable%20HTTP-6E56CF">
+  <img alt="Postgres + pgvector" src="https://img.shields.io/badge/Postgres-pgvector-4169E1?logo=postgresql&logoColor=white">
+  <img alt="Docker" src="https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white">
+</p>
+
+<p>
+  <a href="#быстрый-старт">Быстрый старт</a> ·
+  <a href="#возможности">Возможности</a> ·
+  <a href="#как-это-работает">Как это работает</a> ·
+  <a href="#инструменты">Инструменты</a> ·
+  <a href="#подключение-нейросети">Подключение</a> ·
+  <a href="#развёртывание">Развёртывание</a>
+</p>
+
+</div>
+
+> [!NOTE]
+> **Бета.** Сервис работает на живых каналах, но интерфейс инструментов и схема
+> базы ещё могут меняться.
+
+## Быстрый старт
+
+Нужны Node.js ≥ 24.12 и ffmpeg. Для локального запуска Docker и облачная база не
+нужны: PGlite создаётся в `./data`.
+
+```bash
+npm ci
+cp .env.example .env         # Telegram API ID/hash, эмбеддинги и S3
+npm run login                # телефон → код → (пароль 2FA) → строка сессии
+                             # вставить её в .env как TELEGRAM_SESSION
+npm run dev                  # локально, база — PGlite в ./data
+```
+
+`npm run login` выводит строку сессии; вставьте её в `.env` как
+`TELEGRAM_SESSION`. Остальные значения — Telegram, эмбеддинги и S3 — заполняются
+по комментариям в `.env.example`.
+
+> [!TIP]
+> Подробности — в разделах [медиа и S3](#медиа-и-s3), [эмбеддинги](#эмбеддинги)
+> и [развёртывание](#развёртывание).
+
+## Возможности
+
+- **Полные посты.** Текст с разметкой, альбомы, ответы, реакции, просмотры,
+  пересылки и автор.
+- **Гибридный поиск.** Векторы текста и медиа (pgvector) плюс полнотекстовый
+  поиск по русской морфологии; результаты сливаются через Reciprocal Rank Fusion.
+- **Мультимодальные эмбеддинги.** OpenRouter (`google/gemini-embedding-2`) или
+  Ollama; изображения, аудио и видео индексируются напрямую, без транскрипций и
+  OCR.
+- **Оригиналы в S3.** MCP возвращает `resource_link`, REST — подписанные URL;
+  агент скачивает файл напрямую из хранилища.
+- **Один реестр инструментов.** MCP, REST, OpenAPI и function calling строятся
+  из `src/tools.ts`.
+- **Живое слежение.** История канала, обновления через teleproto и страховочный
+  опрос.
+- **Публичный или закрытый доступ.** Без `API_TOKEN` сервис открыт, с токеном —
+  только по авторизации.
 
 ## Как это работает
 
@@ -74,7 +134,12 @@ flowchart LR
   не проксирует байты. Ссылка ограничена по времени и сама по себе не шифрует
   файл.
 
-## Что видит нейросеть
+> [!TIP]
+> Фоновая очередь скачивает вложения до 100 МиБ; более крупные оригиналы (до
+> 2048 МиБ) `get_post` догружает из Telegram по явному запросу. Вектор строится
+> только для вложений до 100 МиБ и 1800 секунд.
+
+## Инструменты
 
 | Инструмент | Что делает |
 |---|---|
@@ -89,13 +154,44 @@ flowchart LR
 таймкод. Альбомы, просмотры, пересылки, комментарии, реакции, источник
 пересылки и автор сохраняются в выдаче.
 
+<details>
+<summary>Пример выдачи <code>get_post</code></summary>
+
+```json
+{
+  "channel": "Tech News",
+  "message_id": 42,
+  "link": "https://t.me/tech/42",
+  "date": "2026-10-20T10:15:00.000Z",
+  "text": "Короткий текст поста",
+  "media": {
+    "type": "video",
+    "file_name": "clip.mp4",
+    "mime_type": "video/mp4",
+    "size": 12345678,
+    "duration": 42.5,
+    "url": "https://storage.example/...",
+    "expires_at": "2026-10-20T11:15:00.000Z"
+  },
+  "views": 1200,
+  "forwards": 12
+}
+```
+
+</details>
+
 ## Подключение нейросети
 
 Одни и те же инструменты доступны тремя способами — выбирайте тот, который
 понимает ваша модель или клиент.
 
-**1. MCP** — Claude (Desktop, Code, claude.ai), ChatGPT, Cursor, Windsurf,
-LM Studio, Cline, Continue, n8n и любые MCP-клиенты:
+| Способ | Кому подходит | Точка входа |
+|---|---|---|
+| **MCP** | Claude (Desktop, Code, claude.ai), ChatGPT, Cursor, Windsurf, LM Studio, Cline, Continue, n8n | `POST /mcp` |
+| **Function calling** | OpenAI, Gemini, Claude, Mistral, DeepSeek, Qwen, Llama через Ollama/vLLM/OpenRouter | `GET /api/tools` |
+| **OpenAPI** | GPT Actions, Dify, Flowise, LangChain `OpenAPIToolkit` | `GET /openapi.json` |
+
+### MCP
 
 ```json
 {
@@ -112,9 +208,9 @@ LM Studio, Cline, Continue, n8n и любые MCP-клиенты:
 Клиенту, который умеет только stdio: `npx mcp-remote https://<адрес>/mcp`.
 Клиенту, который не умеет заголовки: `https://<адрес>/mcp?token=<API_TOKEN>`.
 
-**2. Function calling** — любая модель, умеющая вызывать функции (OpenAI,
-Gemini, Claude, Mistral, DeepSeek, Qwen, Llama через Ollama/vLLM, всё через
-OpenRouter). Описания функций готовы в нужном формате:
+### Function calling
+
+Описания функций готовы в нужном формате:
 
 ```bash
 curl https://<адрес>/api/tools                    # OpenAI / OpenRouter / Ollama / vLLM / Mistral / Groq
@@ -130,12 +226,15 @@ curl -X POST https://<адрес>/api/tools/search_posts \
   -d '{"query": "что писали про новые видеокарты", "limit": 5}'
 ```
 
-**3. OpenAPI** — `https://<адрес>/openapi.json`: GPT Actions в ChatGPT, Dify,
-Flowise, LangChain `OpenAPIToolkit` и любые агенты, которые читают OpenAPI.
+### OpenAPI
+
+`https://<адрес>/openapi.json` — для GPT Actions в ChatGPT, Dify, Flowise,
+LangChain `OpenAPIToolkit` и любых агентов, которые читают OpenAPI.
 
 Для людей и отладки: `GET /api/search?q=…&channels=@a,@b&from=2026-01-01&limit=5`.
 Сводка всех адресов — `GET /`.
 
+> [!IMPORTANT]
 > **Публичный доступ.** Если `API_TOKEN` не задан, MCP и API открыты всем и дают
 > полные возможности, включая догрузку оригиналов через `get_post` — до 2048 МиБ
 > на вложение. Это расходует трафик Telegram и место в S3. Если такой доступ
@@ -160,7 +259,15 @@ curl -X POST https://<адрес>/api/admin/retry-failed -H '…'               
 
 ## Запуск
 
-Нужны Node.js ≥ 24.12 (TypeScript исполняется напрямую, без сборки) и ffmpeg.
+### Что нужно
+
+| Компонент | Зачем |
+|---|---|
+| Node.js ≥ 24.12 | исполняет TypeScript напрямую, без сборки |
+| `ffmpeg` и `ffprobe` | длительность, сегменты и подготовка медиа |
+| Telegram API ID и hash | userbot |
+| S3-compatible bucket | оригиналы вложений |
+| OpenRouter или Ollama | мультимодальные эмбеддинги |
 
 ```bash
 npm ci
@@ -170,13 +277,12 @@ npm run login                # телефон → код → (пароль 2FA) 
 npm run dev                  # локально, база — PGlite в ./data, Docker не нужен
 ```
 
+### База
+
 База — любой Postgres с pgvector по строке `DATABASE_URL`: в бою облачная
 (Supabase или Neon), локально — встроенная PGlite в `./data` или контейнер
 (`docker compose up --build` поднимает приложение и Postgres с pgvector).
 Схему сервис создаёт сам.
-
-Боевое развёртывание на VPS с облачной базой — как завести Supabase или Neon и чем они отличаются по лимитам (образ из GHCR, системный Caddy, автоматический
-откат) — [deploy/README.md](./deploy/README.md).
 
 ### Аккаунт для userbot'а
 
@@ -195,10 +301,9 @@ GIF) в приватный S3-compatible bucket: фоново — до 100 Ми�
 вектора. Отдельной настройки «какие типы хранить» нет; старая `MEDIA_TYPES`
 отвергается при запуске. S3 обязателен: нужны `S3_REGION`, `S3_BUCKET`,
 `S3_ACCESS_KEY_ID` и `S3_SECRET_ACCESS_KEY`; `S3_ENDPOINT` задаётся для
-нестандартного S3 API. Для
-Neon Object Storage используйте endpoint текущей ветки и `S3_FORCE_PATH_STYLE=true`.
-Bucket должен быть приватным, а endpoint — доступным агентам, которым будут
-выдаваться прямые ссылки.
+нестандартного S3 API. Для Neon Object Storage используйте endpoint текущей
+ветки и `S3_FORCE_PATH_STYLE=true`. Bucket должен быть приватным, а endpoint —
+доступным агентам, которым будут выдаваться прямые ссылки.
 
 В Postgres хранится ключ объекта и метаданные, но не сами байты и не готовые
 ссылки. URL подписывается при выдаче, действует `S3_URL_TTL_SECONDS` секунд
@@ -214,10 +319,9 @@ Bucket должен быть приватным, а endpoint — доступн�
 1800 секунд: более крупные и длинные файлы остаются доступны по ссылке, но в
 поиске по смыслу не участвуют. Переменные `MEDIA_MAX_MB` и `MEDIA_MAX_SECONDS`
 больше не используются: если они остались в старом `.env`, сервис их игнорирует.
-Сбой вложения
-(скачивание, S3, подготовка файла, эмбеддинг) не мешает индексации текста поста:
-вложение получает статус `failed` или `skipped`, а пост остаётся в поиске.
-Пропуски и ошибки видны в `GET /health` и `GET /api/admin/channels`;
+Сбой вложения (скачивание, S3, подготовка файла, эмбеддинг) не мешает индексации
+текста поста: вложение получает статус `failed` или `skipped`, а пост остаётся в
+поиске. Пропуски и ошибки видны в `GET /health` и `GET /api/admin/channels`;
 `POST /api/admin/retry-failed` повторяет неудачные этапы, не загружая заново уже
 сохранённые оригиналы.
 
@@ -261,10 +365,26 @@ Ollama `image,audio`. Вложения остальных типов не обр
 большие пачки.
 
 Смена модели, размерности, набора модальностей или параметров сегментации
-пересоздаёт векторы при старте. Пространства `gemini-embedding-001` и `gemini-embedding-2` несовместимы;
-после перехода сервис заново индексирует исходный текст и уже сохранённые медиа.
-Если оригинал ещё не сохранён, сервис скачивает его из Telegram; удалённые или
-недоступные там файлы автоматически восстановить нельзя.
+пересоздаёт векторы при старте. Пространства `gemini-embedding-001` и
+`gemini-embedding-2` несовместимы; после перехода сервис заново индексирует
+исходный текст и уже сохранённые медиа. Если оригинал ещё не сохранён, сервис
+скачивает его из Telegram; удалённые или недоступные там файлы автоматически
+восстановить нельзя.
+
+## Развёртывание
+
+Боевое развёртывание на VPS с облачной базой: образ собирается в GitHub Actions
+и публикуется в GHCR, системный Caddy отдаёт домен наружу, а `deploy.sh` ждёт
+здоровья контейнера и при неудаче откатывается на прежний тег.
+
+| Что | Как |
+|---|---|
+| Образ | GitHub Actions → GHCR |
+| База | Supabase или Neon с pgvector |
+| Прокси | Caddy |
+| Откат | автоматический при неудачном healthcheck |
+
+Подробная инструкция — [deploy/README.md](./deploy/README.md).
 
 ## Разработка
 
@@ -279,7 +399,7 @@ Telegram — локальные подмены. `ffmpeg`/`ffprobe` настоя�
 
 ## Структура
 
-```
+```text
 src/
   main.ts              вход: база → единая очередь → userbot → HTTP
   config.ts            переменные окружения
