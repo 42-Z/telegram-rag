@@ -111,6 +111,10 @@ export interface PostFilter {
   beforeMessageId?: number;
   /** Только посты новее этого номера сообщения. */
   afterMessageId?: number;
+  /** Только посты с вложениями этих типов. */
+  mediaTypes?: readonly string[];
+  /** Исключить посты с вложениями этих типов (например, стикеры из поиска). */
+  excludeMediaTypes?: readonly string[];
   /** Читать и кэш каналов вне пула: поиск и обычная лента их не видят. */
   includeGuest?: boolean;
 }
@@ -170,6 +174,14 @@ function filterSql(filter: PostFilter, params: unknown[]): string {
   if (filter.to) {
     params.push(filter.to);
     where.push(`p.date <= $${params.length}`);
+  }
+  if (filter.mediaTypes && filter.mediaTypes.length > 0) {
+    params.push(filter.mediaTypes);
+    where.push(`p.media->>'type' = ANY($${params.length}::text[])`);
+  }
+  if (filter.excludeMediaTypes && filter.excludeMediaTypes.length > 0) {
+    params.push(filter.excludeMediaTypes);
+    where.push(`(p.media IS NULL OR p.media->>'type' <> ALL($${params.length}::text[]))`);
   }
   if (filter.beforeMessageId !== undefined) {
     params.push(filter.beforeMessageId);

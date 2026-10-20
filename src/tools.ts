@@ -14,6 +14,7 @@ import { logger } from "./log.ts";
 import { postKey, presentPost, presentPostMedia } from "./presentation.ts";
 import type { ObjectStorage } from "./storage.ts";
 import type { Post, PostFilter, SearchHit, Store } from "./store.ts";
+import { SEARCH_EXCLUDED_MEDIA_TYPES } from "./telegram/normalize.ts";
 import type { GuestReader } from "./telegram/reader.ts";
 
 const log = logger("tools");
@@ -49,6 +50,57 @@ const channelsArg = z
   .describe("Ограничить каналами: @имя, ссылка t.me или id. Не задано — весь пул");
 const dateFromArg = z.string().optional().describe("С даты включительно, ISO 8601: 2026-03-01 или 2026-03-01T12:00:00Z");
 const dateToArg = z.string().optional().describe("По дату включительно, ISO 8601");
+const mediaTypesArg = z
+  .union([z.string(), z.array(z.string())])
+  .optional()
+  .describe(
+    "Только посты с вложениями этих типов: photo, sticker, custom_emoji, document, voice, audio, video, video_note, " +
+      "gif, webpage, poll, geo, venue, geo_live, contact, dice, game, invoice, story, giveaway, giveaway_results, " +
+      "paid_media, todo, video_stream, unsupported. Можно строкой или массивом",
+  );
+
+const mediaTypeAliases: Record<string, string> = {
+  image: "photo",
+  images: "photo",
+  photo: "photo",
+  photos: "photo",
+  sticker: "sticker",
+  stickers: "sticker",
+  document: "document",
+  documents: "document",
+  doc: "document",
+  docs: "document",
+  voice: "voice",
+  voices: "voice",
+  audio: "audio",
+  audios: "audio",
+  music: "audio",
+  video: "video",
+  videos: "video",
+  videonote: "video_note",
+  video_note: "video_note",
+  round: "video_note",
+  gif: "gif",
+  gifs: "gif",
+  giveaway: "giveaway",
+  giveaways: "giveaway",
+  "giveaway-results": "giveaway_results",
+  giveaway_results: "giveaway_results",
+  paid: "paid_media",
+  paid_media: "paid_media",
+  paidmedia: "paid_media",
+};
+
+function normalizeMediaTypes(value: string | string[] | undefined): string[] | undefined {
+  if (value === undefined) return undefined;
+  const values = Array.isArray(value) ? value : [value];
+  const types = values
+    .flatMap((item) => item.split(","))
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean)
+    .map((item) => mediaTypeAliases[item] ?? item);
+  return types.length > 0 ? [...new Set(types)] : undefined;
+}
 
 function parseDate(value: string | undefined, endOfDay: boolean): Date | undefined {
   if (!value) return undefined;
@@ -138,6 +190,7 @@ async function presentFeed(
   return {
     posts: collapsed.map((post) => presentAlbumAware(post, media)),
     minMessageId: allPosts.length > 0 ? Math.min(...allPosts.map((post) => post.messageId)) : undefined,
+    maxMessageId: allPosts.length > 0 ? Math.max(...allPosts.map((post) => post.messageId)) : undefined,
   };
 }
 
@@ -151,6 +204,82 @@ function withoutChannel(posts: ReadonlyArray<Record<string, unknown>>): Array<Re
     return rest;
   };
   return posts.map(strip);
+}
+
+/** Сколько сообщений просматривать в поисках нужного типа, чтобы не зависнуть. */
+const MEDIA_SCAN_LIMIT = 500;
+const MEDIA_SCAN_BATCH = 100;
+
+/** Посты канала из базы; фильтр по типу вложения просматривает несколько страниц. */
+async function collectChannelPosts(
+  store: Pick<Store, "listPosts">,
+  channelId: number,
+  options: {
+    limit: number;
+    beforeMessageId?: number;
+    afterMessageId?: number;
+    mediaTypes?: readonly string[];
+  },
+): Promise<{ posts: Post[]; nextBeforeMessageId?: number; nextAfterMessageId?: number }> {
+  if (!options.mediaTypes || options.mediaTypes.length === 0) {
+    const { posts } = await store.listPosts({
+      channelIds: [channelId],
+      beforeMessageId: options.beforeMessageId,
+      afterMessageId: options.afterMessageId,
+      order: "newest",
+      limit: options.limit,
+    });
+    return {
+      posts,
+      nextBeforeMessageId: posts.length > 0 ? Math.min(...posts.map((post) => post.messageId)) : undefined,
+      nextAfterMessageId: options.afterMessageId !== undefined && posts.length > 0
+        ? Math.max(...posts.map((post) => post.messageId))
+        : undefined,
+    };
+  }
+
+  const forward = options.afterMessageId !== undefined;
+  let before = options.beforeMessageId;
+  let after = options.afterMessageId;
+  let nextBeforeMessageId: number | undefined;
+  let nextAfterMessageId: number | undefined;
+  const matches: Post[] = [];
+  let scanned = 0;
+
+  while (scanned < MEDIA_SCAN_LIMIT && matches.length < options.limit) {
+    const { posts } = await store.listPosts({
+      channelIds: [channelId],
+      beforeMessageId: before,
+      afterMessageId: after,
+      order: forward ? "oldest" : "newest",
+      limit: MEDIA_SCAN_BATCH,
+    });
+    if (posts.length === 0) break;
+    scanned += posts.length;
+    for (const post of posts) {
+      if (post.media && options.mediaTypes.includes(post.media.type)) matches.push(post);
+    }
+    if (forward) {
+      nextAfterMessageId = Math.max(...posts.map((post) => post.messageId));
+      after = nextAfterMessageId;
+    } else {
+      nextBeforeMessageId = Math.min(...posts.map((post) => post.messageId));
+      before = nextBeforeMessageId;
+    }
+    if (posts.length < MEDIA_SCAN_BATCH) break;
+  }
+
+  const limited = matches.sort((a, b) => b.messageId - a.messageId).slice(0, options.limit);
+  if (matches.length > options.limit) {
+    if (forward) nextAfterMessageId = limited[limited.length - 1]!.messageId;
+    else nextBeforeMessageId = limited[limited.length - 1]!.messageId;
+  }
+
+  return {
+    posts: limited,
+    nextBeforeMessageId,
+    nextAfterMessageId: forward ? nextAfterMessageId : undefined,
+  };
 }
 
 /** Ошибки Telegram для канала вне пула — понятный отказ инструмента, а не 500. */
@@ -236,6 +365,8 @@ export const TOOLS: ToolDef[] = [
     async run(args, { store, embedder, storage }) {
       const limit = args.limit ?? 10;
       const filter = await buildFilter(store, args);
+      // Стикеры, раздачи и платные медиа видны в ленте, но не в поиске.
+      filter.excludeMediaTypes = SEARCH_EXCLUDED_MEDIA_TYPES;
       let mode = args.mode ?? "hybrid";
       let notice: string | undefined;
 
@@ -390,7 +521,8 @@ export const TOOLS: ToolDef[] = [
     description:
       "Посты одного канала по @имени, ссылке t.me/<имя> или id — от новых к старым. Работает и для каналов вне " +
       "пула: они читаются из Telegram, живут во временном кэше, не участвуют в поиске, вложения не архивируются. " +
-      "Перелистывание вглубь — before_message_id, добрать новее — after_message_id.",
+      "Перелистывание вглубь — before_message_id, добрать новее — after_message_id. " +
+      "media_types оставляет только посты с документами, стикерами или другими указанными вложениями.",
     readOnly: false,
     input: z.object({
       channel: z.string().min(1).describe("@имя, ссылка https://t.me/<имя> или id канала"),
@@ -407,25 +539,26 @@ export const TOOLS: ToolDef[] = [
         .positive()
         .optional()
         .describe("Только посты новее этого номера — чтобы добрать новые"),
+      media_types: mediaTypesArg,
     }),
     async run(args, { store, storage, guests }) {
       const limit = args.limit ?? 20;
+      const mediaTypes = normalizeMediaTypes(args.media_types);
       const channel = await store.findChannel(args.channel);
 
       if (channel && !channel.enabled) {
         throw new ToolError(`канал «${args.channel}» отключён: включите его в управлении или читайте другой публичный канал`);
       }
 
-      let posts: Post[];
+      let result: { posts: Post[]; nextBeforeMessageId?: number; nextAfterMessageId?: number };
       let archived = true;
       if (channel && !channel.expiresAt) {
-        posts = (await store.listPosts({
-          channelIds: [channel.id],
+        result = await collectChannelPosts(store, channel.id, {
+          limit,
           beforeMessageId: args.before_message_id,
           afterMessageId: args.after_message_id,
-          order: "newest",
-          limit,
-        })).posts;
+          mediaTypes,
+        });
       } else {
         if (!guests) {
           throw new ToolError("Telegram не подключён: каналы вне пула прочитать нельзя, доступны только каналы пула");
@@ -435,16 +568,24 @@ export const TOOLS: ToolDef[] = [
             limit,
             beforeMessageId: args.before_message_id,
             afterMessageId: args.after_message_id,
+            mediaTypes,
           }),
         );
-        posts = page.posts;
+        result = {
+          posts: page.posts,
+          nextBeforeMessageId: page.nextBeforeMessageId,
+          nextAfterMessageId: page.nextAfterMessageId,
+        };
         archived = false;
       }
 
-      const feed = await presentFeed(posts, store, storage, { archived });
+      const feed = await presentFeed(result.posts, store, storage, { archived });
       return {
         posts: withoutChannel(feed.posts),
-        next_before_message_id: feed.minMessageId,
+        next_before_message_id: feed.minMessageId ?? result.nextBeforeMessageId,
+        next_after_message_id: args.after_message_id !== undefined
+          ? feed.maxMessageId ?? result.nextAfterMessageId
+          : undefined,
       };
     },
   }),

@@ -35,15 +35,23 @@ const history: MessageLike[] = [
 
 class FakeSource implements ChannelSource {
   /** История и сообщения, которые Telegram отдаёт прямо сейчас. */
-  items: MessageLike[] = [...history];
+  items: MessageLike[];
   calls: HistoryParams[] = [];
   fail = false;
+  private readonly entity: ResolvedChannel;
+  private readonly username: string;
+
+  constructor(entity: ResolvedChannel = channel, username = "outside", items: MessageLike[] = [...history]) {
+    this.entity = entity;
+    this.username = username;
+    this.items = items;
+  }
 
   async resolve(ref: string): Promise<ResolvedChannel> {
     if (this.fail) throw new Error("telegram unavailable");
     const parsed = parseChannelRef(ref);
-    if (parsed.kind !== "username" || parsed.value !== "outside") throw new Error("нет такого публичного канала");
-    return channel;
+    if (parsed.kind !== "username" || parsed.value !== this.username) throw new Error("нет такого публичного канала");
+    return this.entity;
   }
 
   async history(_peer: ResolvedChannel["peer"], params: HistoryParams): Promise<MessageLike[]> {
@@ -120,6 +128,53 @@ describe("каналы вне пула", () => {
 
     const range = await guest.read("@outside", { afterMessageId: 1, beforeMessageId: 5, limit: 10 });
     expect(range.posts.map((post) => post.messageId)).toEqual([4, 3, 2]);
+  });
+
+  it("фильтрует документы во внешнем канале, не теряя страницу", async () => {
+    const docsEntity: ResolvedChannel = {
+      id: 5002,
+      username: "docs",
+      title: "Документы",
+      about: null,
+      accessHash: "43",
+      peer: new Api.InputPeerChannel({ channelId: bigInt(5002), accessHash: bigInt(43) }),
+    };
+    const docsSource = new FakeSource(docsEntity, "docs", [
+      message(1, "Текст без файла"),
+      message(2, "Первый документ", {
+        media: {
+          className: "MessageMediaDocument",
+          document: {
+            id: { toString: () => "8001" },
+            mimeType: "application/pdf",
+            attributes: [{ className: "DocumentAttributeFilename", fileName: "first.pdf" }],
+          },
+        },
+      }),
+      message(3, "Ещё текст"),
+      message(4, "Второй документ", {
+        media: {
+          className: "MessageMediaDocument",
+          document: {
+            id: { toString: () => "8002" },
+            mimeType: "application/pdf",
+            attributes: [{ className: "DocumentAttributeFilename", fileName: "second.pdf" }],
+          },
+        },
+      }),
+    ]);
+    const docsReader = new GuestReader(store, docsSource, { ttlSeconds: 3600, maxChannels: 10 });
+
+    const first = await docsReader.read("@docs", { limit: 1, mediaTypes: ["document"] });
+    expect(first.posts.map((post) => post.messageId)).toEqual([4]);
+    expect(first.nextBeforeMessageId).toBe(4);
+
+    const second = await docsReader.read("@docs", {
+      limit: 5,
+      mediaTypes: ["document"],
+      beforeMessageId: first.nextBeforeMessageId,
+    });
+    expect(second.posts.map((post) => post.messageId)).toEqual([2]);
   });
 
   it("дочитывает альбом, обрезанный краем страницы", async () => {

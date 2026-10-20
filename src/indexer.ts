@@ -15,7 +15,7 @@ import { type MediaProbe } from "./media/ffmpeg.ts";
 import type { PreparedMediaChunk } from "./media/prepare.ts";
 import type { ObjectStorage } from "./storage.ts";
 import type { IndexedChunk, MediaAsset, MediaAssetReference, MediaJob, Post, Store } from "./store.ts";
-import { mediaSourceFingerprint, searchableText } from "./telegram/normalize.ts";
+import { mediaSourceFingerprint, SEARCH_EXCLUDED_MEDIA_TYPES, searchableText } from "./telegram/normalize.ts";
 
 const log = logger("indexer");
 const asDocument = (text: string) => ({ type: "text", purpose: "document", text }) as const;
@@ -320,7 +320,10 @@ export class Indexer {
       await this.store.markMediaEmbeddingSkipped(assetRef(mediaJob), mediaSkipReason);
     }
 
-    const text = searchableText(post);
+    // Стикеры, раздачи и платные медиа остаются в ленте, но в поиске не участвуют.
+    // Всё равно помечаем пост обработанным, чтобы он не висел в очереди.
+    const searchExcluded = Boolean(post.media && SEARCH_EXCLUDED_MEDIA_TYPES.includes(post.media.type));
+    const text = searchExcluded ? "" : searchableText(post);
     const textChunks = buildChunks({ channelTitle: post.channelTitle, date: new Date(post.date), text });
     const chunks: IndexedChunk[] = [];
 

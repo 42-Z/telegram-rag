@@ -11,12 +11,14 @@ import type { TelegramClient } from "teleproto";
 import { logger } from "../log.ts";
 import type { Channel, Post, Store } from "../store.ts";
 import { type ResolvedChannel, parseChannelRef, resolveChannel } from "./client.ts";
-import { type MessageLike, isPost, normalizeMessage } from "./normalize.ts";
+import { type MessageLike, describeMedia, isPost, normalizeMessage } from "./normalize.ts";
 
 const log = logger("guest");
 
 /** Сколько сообщений Telegram отдаёт за один запрос истории. */
 const MAX_FETCH = 100;
+/** Сколько сообщений просматривать в поисках нужного типа, чтобы не зависнуть. */
+const MEDIA_SCAN_LIMIT = 500;
 /** Запас по номерам сообщений вокруг края альбома. */
 const ALBUM_MARGIN = 10;
 /** Сколько соседних сообщений запрашивать вокруг альбома. */
@@ -71,6 +73,8 @@ export interface GuestReadOptions {
   beforeMessageId?: number;
   afterMessageId?: number;
   order?: "newest" | "oldest";
+  /** Только посты с вложениями этих типов. */
+  mediaTypes?: readonly string[];
 }
 
 export interface GuestPage {
@@ -78,6 +82,7 @@ export interface GuestPage {
   posts: Post[];
   hasMore: boolean;
   nextBeforeMessageId?: number;
+  nextAfterMessageId?: number;
   fromCache: boolean;
   notice?: string;
 }
@@ -118,20 +123,43 @@ export class GuestReader {
       );
 
       const limit = options.limit;
-      const fetched = (await this.source.history(resolved.peer, this.historyParams(options, Math.min(MAX_FETCH, limit + 1))))
-        .filter(isPost);
-      const page = fetched.slice(0, limit);
-      const hasMore = fetched.length > page.length || (limit >= MAX_FETCH && fetched.length >= MAX_FETCH);
+      const mediaTypes = options.mediaTypes && options.mediaTypes.length > 0 ? options.mediaTypes : undefined;
+      let page: MessageLike[];
+      let hasMore: boolean;
+      let nextBeforeMessageId: number | undefined;
+      let nextAfterMessageId: number | undefined;
+
+      if (!mediaTypes) {
+        const fetched = (await this.source.history(resolved.peer, this.historyParams(options, Math.min(MAX_FETCH, limit + 1))))
+          .filter(isPost);
+        page = fetched.slice(0, limit);
+        hasMore = fetched.length > page.length || (limit >= MAX_FETCH && fetched.length >= MAX_FETCH);
+        nextBeforeMessageId = page.length > 0 ? Math.min(...page.map((message) => message.id)) : undefined;
+        nextAfterMessageId = options.afterMessageId !== undefined && page.length > 0
+          ? Math.max(...page.map((message) => message.id))
+          : undefined;
+      } else {
+        const scanned = await this.scanByMediaTypes(resolved.peer, options, limit, mediaTypes);
+        page = scanned.messages;
+        hasMore = scanned.hasMore;
+        nextBeforeMessageId = scanned.nextBeforeMessageId;
+        nextAfterMessageId = scanned.nextAfterMessageId;
+      }
+
       const complete = await this.completeAlbums(resolved.peer, page);
       await this.save(channel.id, complete);
 
       const posts = await this.orderedPosts(channel.id, complete, options.order ?? "newest");
-      const nextBeforeMessageId = complete.length > 0 ? Math.min(...complete.map((message) => message.id)) : undefined;
       return {
         channel,
         posts,
         hasMore,
-        nextBeforeMessageId,
+        nextBeforeMessageId: complete.length > 0
+          ? Math.min(nextBeforeMessageId ?? Number.MAX_SAFE_INTEGER, ...complete.map((message) => message.id))
+          : nextBeforeMessageId,
+        nextAfterMessageId: options.afterMessageId !== undefined && complete.length > 0
+          ? Math.max(nextAfterMessageId ?? 0, ...complete.map((message) => message.id))
+          : nextAfterMessageId,
         fromCache: false,
       };
     } catch (error) {
@@ -263,11 +291,66 @@ export class GuestReader {
     }
   }
 
+  /** Сканирует историю страницами, пока не наберёт `limit` постов нужных типов. */
+  private async scanByMediaTypes(
+    peer: ResolvedChannel["peer"],
+    options: GuestReadOptions,
+    limit: number,
+    mediaTypes: readonly string[],
+  ): Promise<{ messages: MessageLike[]; hasMore: boolean; nextBeforeMessageId?: number; nextAfterMessageId?: number }> {
+    const forward = options.afterMessageId !== undefined;
+    let before = options.beforeMessageId;
+    let after = options.afterMessageId;
+    let nextBeforeMessageId: number | undefined;
+    let nextAfterMessageId: number | undefined;
+    let scanned = 0;
+    let hasMore = false;
+    const matches: MessageLike[] = [];
+
+    while (scanned < MEDIA_SCAN_LIMIT && matches.length < limit) {
+      const batch = (await this.source.history(peer, {
+        limit: MAX_FETCH,
+        ...(forward
+          ? { minId: after, maxId: before, reverse: true }
+          : { offsetId: before }),
+      })).filter(isPost);
+      if (batch.length === 0) break;
+      scanned += batch.length;
+      for (const message of batch) {
+        const type = describeMedia(message.media)?.type;
+        if (type && mediaTypes.includes(type)) matches.push(message);
+      }
+      hasMore = batch.length >= MAX_FETCH || matches.length > limit;
+      if (forward) {
+        nextAfterMessageId = Math.max(...batch.map((message) => message.id));
+        after = nextAfterMessageId;
+      } else {
+        nextBeforeMessageId = Math.min(...batch.map((message) => message.id));
+        before = nextBeforeMessageId;
+      }
+      if (batch.length < MAX_FETCH) break;
+    }
+
+    const limited = matches.slice(0, limit);
+    if (matches.length > limit) {
+      if (forward) nextAfterMessageId = limited[limited.length - 1]!.id;
+      else nextBeforeMessageId = limited[limited.length - 1]!.id;
+    }
+
+    return {
+      messages: limited,
+      hasMore,
+      nextBeforeMessageId: forward ? undefined : nextBeforeMessageId,
+      nextAfterMessageId: forward ? nextAfterMessageId : undefined,
+    };
+  }
+
   /** Посты из ещё живого кэша; для запасного пути, когда Telegram недоступен. */
   private async cachedPage(channel: Channel, options: GuestReadOptions): Promise<GuestPage> {
     const { posts, total } = await this.store.listPosts({
       channelIds: [channel.id],
       includeGuest: true,
+      mediaTypes: options.mediaTypes,
       beforeMessageId: options.beforeMessageId,
       afterMessageId: options.afterMessageId,
       order: options.order ?? "newest",
@@ -278,6 +361,9 @@ export class GuestReader {
       posts,
       hasMore: total > posts.length,
       nextBeforeMessageId: posts.length > 0 ? Math.min(...posts.map((post) => post.messageId)) : undefined,
+      nextAfterMessageId: options.afterMessageId !== undefined && posts.length > 0
+        ? Math.max(...posts.map((post) => post.messageId))
+        : undefined,
       fromCache: true,
     };
   }

@@ -1,7 +1,17 @@
 import type { ObjectStorage } from "./storage.ts";
 import type { MediaAsset, Post, Store } from "./store.ts";
 
-const DOWNLOADABLE_TYPES = new Set(["photo", "voice", "video_note", "audio", "video", "gif"]);
+const DOWNLOADABLE_TYPES = new Set([
+  "photo",
+  "voice",
+  "video_note",
+  "audio",
+  "video",
+  "gif",
+  "sticker",
+  "document",
+  "custom_emoji",
+]);
 
 export interface MediaLinkResource {
   type: "resource_link";

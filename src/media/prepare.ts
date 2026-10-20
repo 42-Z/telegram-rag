@@ -36,6 +36,9 @@ const mimeByExtension: Record<string, string> = {
   wav: "audio/wav",
   webm: "video/webm",
   gif: "image/gif",
+  webp: "image/webp",
+  pdf: "application/pdf",
+  zip: "application/zip",
 };
 
 /** Какую модальность модели нужно уметь, чтобы построить вектор для вложения этого типа. */
@@ -48,8 +51,14 @@ const modalityByMediaType = {
   gif: "video",
 } as const satisfies Record<string, Modality>;
 
+/**
+ * Вложения без вектора: стикеры, документы и кастомные эмодзи сохраняются в S3
+ * и отдаются вместе с постом, но в поиске по медиа не участвуют.
+ */
+const archiveOnlyMediaTypes = ["sticker", "document", "custom_emoji"] as const;
+
 /** Все типы вложений, которые сохраняются в S3; векторы строятся только для поддерживаемых моделью. */
-export const MEDIA_TYPES: readonly string[] = Object.keys(modalityByMediaType);
+export const MEDIA_TYPES: readonly string[] = [...Object.keys(modalityByMediaType), ...archiveOnlyMediaTypes];
 
 export function mediaModality(mediaType: string): Modality | undefined {
   return (modalityByMediaType as Record<string, Modality>)[mediaType];
