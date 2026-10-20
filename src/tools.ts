@@ -361,88 +361,77 @@ async function presentFeed(
   const expanded = posts.flatMap((post) => post.groupedId ? albums.get(`${post.channelId}:${post.groupedId}`) ?? [post] : [post]);
   const unique = [...new Map(expanded.map((post) => [postKey(post), post])).values()];
   const collapsed = collapseAlbums(unique);
-  const allPosts = collapsed.flatMap((post) => post.album ?? [post]);
   return {
     posts: collapsed.map((post) => compactAlbumAware(post)),
-    minMessageId: allPosts.length > 0 ? Math.min(...allPosts.map((post) => post.messageId)) : undefined,
-    maxMessageId: allPosts.length > 0 ? Math.max(...allPosts.map((post) => post.messageId)) : undefined,
   };
 }
 
-/** Сколько сообщений просматривать в поисках нужного типа, чтобы не зависнуть. */
-const MEDIA_SCAN_LIMIT = 500;
-const MEDIA_SCAN_BATCH = 100;
-
-/** Посты канала из базы; фильтр по типу вложения просматривает несколько страниц. */
-async function collectChannelPosts(
-  store: Pick<Store, "listPosts">,
+/** Посты канала из базы; offset считается по постам после свёртки альбомов. */
+async function collectDisplayedPosts(
+  store: Pick<Store, "listPosts" | "getAlbum">,
   channelId: number,
   options: {
-    limit: number;
-    beforeMessageId?: number;
-    afterMessageId?: number;
+    includeGuest: boolean;
+    from?: Date;
+    to?: Date;
     mediaTypes?: readonly string[];
+    offset: number;
+    limit: number;
   },
-): Promise<{ posts: Post[]; nextBeforeMessageId?: number; nextAfterMessageId?: number }> {
-  if (!options.mediaTypes || options.mediaTypes.length === 0) {
-    const { posts } = await store.listPosts({
+): Promise<{ posts: Post[]; returned: number; exhausted: boolean }> {
+  const target = options.offset + options.limit;
+  const seenAlbums = new Set<string>();
+  const selected: Post[] = [];
+  let displayed = 0;
+  let returned = 0;
+  let rawOffset = 0;
+  let total = 0;
+  let exhausted = false;
+
+  while (displayed < target) {
+    const page = await store.listPosts({
       channelIds: [channelId],
-      beforeMessageId: options.beforeMessageId,
-      afterMessageId: options.afterMessageId,
+      includeGuest: options.includeGuest,
+      from: options.from,
+      to: options.to,
+      mediaTypes: options.mediaTypes,
       order: "newest",
-      limit: options.limit,
+      limit: 100,
+      offset: rawOffset,
     });
-    return {
-      posts,
-      nextBeforeMessageId: posts.length > 0 ? Math.min(...posts.map((post) => post.messageId)) : undefined,
-      nextAfterMessageId: options.afterMessageId !== undefined && posts.length > 0
-        ? Math.max(...posts.map((post) => post.messageId))
-        : undefined,
-    };
-  }
-
-  const forward = options.afterMessageId !== undefined;
-  let before = options.beforeMessageId;
-  let after = options.afterMessageId;
-  let nextBeforeMessageId: number | undefined;
-  let nextAfterMessageId: number | undefined;
-  const matches: Post[] = [];
-  let scanned = 0;
-
-  while (scanned < MEDIA_SCAN_LIMIT && matches.length < options.limit) {
-    const { posts } = await store.listPosts({
-      channelIds: [channelId],
-      beforeMessageId: before,
-      afterMessageId: after,
-      order: forward ? "oldest" : "newest",
-      limit: MEDIA_SCAN_BATCH,
-    });
-    if (posts.length === 0) break;
-    scanned += posts.length;
-    for (const post of posts) {
-      if (post.media && options.mediaTypes.includes(post.media.type)) matches.push(post);
+    total = page.total;
+    if (page.posts.length === 0) {
+      exhausted = true;
+      break;
     }
-    if (forward) {
-      nextAfterMessageId = Math.max(...posts.map((post) => post.messageId));
-      after = nextAfterMessageId;
-    } else {
-      nextBeforeMessageId = Math.min(...posts.map((post) => post.messageId));
-      before = nextBeforeMessageId;
+    rawOffset += page.posts.length;
+
+    for (const post of page.posts) {
+      let entry: Post[];
+      if (post.groupedId) {
+        const key = `${post.channelId}:${post.groupedId}`;
+        if (seenAlbums.has(key)) continue;
+        seenAlbums.add(key);
+        entry = await store.getAlbum(post.channelId, post.groupedId);
+        if (entry.length === 0) entry = [post];
+      } else {
+        entry = [post];
+      }
+
+      displayed += 1;
+      if (displayed > options.offset && returned < options.limit) {
+        selected.push(...entry);
+        returned += 1;
+      }
     }
-    if (posts.length < MEDIA_SCAN_BATCH) break;
+    if (page.posts.length < 100) {
+      exhausted = displayed <= target;
+      break;
+    }
   }
 
-  const limited = matches.sort((a, b) => b.messageId - a.messageId).slice(0, options.limit);
-  if (matches.length > options.limit) {
-    if (forward) nextAfterMessageId = limited[limited.length - 1]!.messageId;
-    else nextBeforeMessageId = limited[limited.length - 1]!.messageId;
-  }
-
-  return {
-    posts: limited,
-    nextBeforeMessageId,
-    nextAfterMessageId: forward ? nextAfterMessageId : undefined,
-  };
+  if (rawOffset >= total) exhausted = displayed <= target;
+  return { posts: selected, returned, exhausted };
 }
 
 /** Ошибки Telegram для канала вне пула — понятный отказ инструмента, а не 500. */
@@ -685,28 +674,22 @@ export const TOOLS: ToolDef[] = [
       "Короткая лента одного канала по @имени, ссылке t.me/<имя> или id — от новых к старым. Работает и для " +
       "каналов вне пула. Отдаёт message_id, link, date, text, media и album без просмотров, реакций, комментариев " +
       "и служебных полей вложений; подробности и скачивание — через get_post. " +
-      "Перелистывание вглубь — before_message_id, добрать новее — after_message_id. " +
+      "date_from и date_to включают границы, offset пропускает посты для следующей страницы, " +
       "media_types оставляет только посты с документами, стикерами или другими указанными вложениями.",
     readOnly: false,
     input: z.object({
       channel: z.string().min(1).describe("@имя, ссылка https://t.me/<имя> или id канала"),
+      date_from: dateFromArg,
+      date_to: dateToArg,
       limit: z.number().int().min(1).max(100).optional().describe("Сколько постов вернуть, по умолчанию 20"),
-      before_message_id: z
-        .number()
-        .int()
-        .positive()
-        .optional()
-        .describe("Только посты старше этого номера — для следующей страницы вглубь"),
-      after_message_id: z
-        .number()
-        .int()
-        .positive()
-        .optional()
-        .describe("Только посты новее этого номера — чтобы добрать новые"),
+      offset: z.number().int().min(0).optional().describe("Пропустить столько постов — для следующей страницы"),
       media_types: mediaTypesArg,
     }),
     async run(args, { store, guests }) {
       const limit = args.limit ?? 20;
+      const offset = args.offset ?? 0;
+      const from = parseDate(args.date_from, false);
+      const to = parseDate(args.date_to, true);
       const mediaTypes = normalizeMediaTypes(args.media_types);
       const channel = await store.findChannel(args.channel);
 
@@ -714,39 +697,58 @@ export const TOOLS: ToolDef[] = [
         throw new ToolError(`канал «${args.channel}» отключён: включите его в управлении или читайте другой публичный канал`);
       }
 
-      let result: { posts: Post[]; nextBeforeMessageId?: number; nextAfterMessageId?: number };
+      let channelId: number;
+      let includeGuest = false;
+      let complete = true;
+      let page: { posts: Post[]; returned: number; exhausted: boolean };
+
       if (channel && !channel.expiresAt) {
-        result = await collectChannelPosts(store, channel.id, {
-          limit,
-          beforeMessageId: args.before_message_id,
-          afterMessageId: args.after_message_id,
+        channelId = channel.id;
+        page = await collectDisplayedPosts(store, channelId, {
+          includeGuest: false,
+          from,
+          to,
           mediaTypes,
+          offset,
+          limit,
         });
       } else {
         if (!guests) {
           throw new ToolError("Telegram не подключён: каналы вне пула прочитать нельзя, доступны только каналы пула");
         }
-        const page = await guestCall(args.channel, () =>
-          guests.read(args.channel, {
-            limit,
-            beforeMessageId: args.before_message_id,
-            afterMessageId: args.after_message_id,
+        includeGuest = true;
+        channelId = 0;
+        page = { posts: [], returned: 0, exhausted: false };
+        let needed = offset + limit;
+        while (true) {
+          const ensured = await guestCall(args.channel, () =>
+            guests.ensurePosts(args.channel, {
+              needed,
+              dateFrom: from,
+              dateTo: to,
+              mediaTypes,
+            }),
+          );
+          channelId = ensured.channel.id;
+          complete = ensured.complete;
+          page = await collectDisplayedPosts(store, channelId, {
+            includeGuest,
+            from,
+            to,
             mediaTypes,
-          }),
-        );
-        result = {
-          posts: page.posts,
-          nextBeforeMessageId: page.nextBeforeMessageId,
-          nextAfterMessageId: page.nextAfterMessageId,
-        };
+            offset,
+            limit,
+          });
+          if (page.returned >= limit || ensured.complete) break;
+          needed *= 2;
+        }
       }
 
-      const feed = await presentFeed(result.posts, store);
+      const feed = await presentFeed(page.posts, store);
       return {
         posts: feed.posts,
-        next_before_message_id: feed.minMessageId ?? result.nextBeforeMessageId,
-        next_after_message_id: args.after_message_id !== undefined
-          ? feed.maxMessageId ?? result.nextAfterMessageId
+        next_offset: page.returned >= limit && !(complete && page.exhausted)
+          ? offset + page.returned
           : undefined,
       };
     },

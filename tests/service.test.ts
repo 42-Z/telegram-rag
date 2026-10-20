@@ -153,17 +153,24 @@ describe("REST", () => {
 
     const first = await tool("list_posts", { channel: "@tech", limit: 1 });
     expect(first.body.posts.map((post: any) => post.message_id)).toEqual([4]);
-    expect(first.body.next_before_message_id).toBe(3);
+    expect(first.body.next_offset).toBe(1);
 
-    const older = await tool("list_posts", { channel: "@tech", limit: 10, before_message_id: 3 });
+    const older = await tool("list_posts", { channel: "@tech", limit: 10, offset: 1 });
     expect(older.body.posts.map((post: any) => post.message_id)).toEqual([2, 1]);
-    expect(older.body.next_before_message_id).toBe(1);
+    expect(older.body.next_offset).toBeUndefined();
+
+    const dated = await tool("list_posts", {
+      channel: "@tech",
+      date_from: "2026-09-01T14:00:00Z",
+      date_to: "2026-09-01T16:00:00Z",
+    });
+    expect(dated.body.posts.map((post: any) => post.message_id)).toEqual([4, 2]);
   });
 
   it("list_posts читает канал пула без Telegram", async () => {
     const { status, body } = await tool("list_posts", { channel: "@tech", limit: 3 });
     expect(status).toBe(200);
-    expect(body.posts.map((post: any) => post.message_id)).toEqual([4, 2]);
+    expect(body.posts.map((post: any) => post.message_id)).toEqual([4, 2, 1]);
 
     const outside = await tool("list_posts", { channel: "@durov", limit: 1 });
     expect(outside.status).toBe(400);
@@ -273,7 +280,7 @@ describe("подключение любых моделей", () => {
 
     const channel = (await client.callTool({ name: "list_posts", arguments: { channel: "@tech", limit: 3 } })) as any;
     const channelPayload = JSON.parse(channel.content[0].text);
-    expect(channelPayload.posts.map((post: any) => post.message_id)).toEqual([4, 2]);
+    expect(channelPayload.posts.map((post: any) => post.message_id)).toEqual([4, 2, 1]);
     expect(channelPayload.posts[0].channel).toBeUndefined();
 
     const error = (await client.callTool({ name: "get_post", arguments: { link: "мусор" } })) as any;

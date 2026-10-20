@@ -59,6 +59,7 @@ class FakeSource implements ChannelSource {
     this.calls.push(params);
     const list = this.items
       .filter((item) => {
+        if (params.offsetDate !== undefined && (item.date ?? 0) >= params.offsetDate) return false;
         if (params.minId !== undefined && item.id <= params.minId) return false;
         if (params.maxId !== undefined && item.id >= params.maxId) return false;
         if (params.offsetId !== undefined && item.id >= params.offsetId) return false;
@@ -113,18 +114,29 @@ describe("каналы вне пула", () => {
     expect(search.body.error).toContain("вне пула");
   });
 
-  it("перелистывает вглубь и добирает новее", async () => {
-    const older = await call("list_posts", { channel: "@outside", before_message_id: 3, limit: 2 });
-    expect(older.status).toBe(200);
-    expect(older.body.posts.map((post: any) => post.message_id)).toEqual([2, 1]);
-    expect(older.body.next_before_message_id).toBe(1);
+  it("листает ленту по offset и датам", async () => {
+    const first = await call("list_posts", { channel: "@outside", limit: 1 });
+    expect(first.status).toBe(200);
+    expect(first.body.posts.map((post: any) => post.message_id)).toEqual([5]);
+    expect(first.body.next_offset).toBe(1);
+
+    const second = await call("list_posts", { channel: "@outside", limit: 2, offset: 1 });
+    expect(second.body.posts.map((post: any) => post.message_id)).toEqual([4, 2]);
+    expect(second.body.next_offset).toBe(3);
+
+    const third = await call("list_posts", { channel: "@outside", limit: 2, offset: 3 });
+    expect(third.body.posts.map((post: any) => post.message_id)).toEqual([1]);
+    expect(third.body.next_offset).toBeUndefined();
+
+    const dated = await call("list_posts", {
+      channel: "@outside",
+      date_from: "2026-09-01T15:00:00Z",
+      date_to: "2026-09-01T17:00:00Z",
+    });
+    expect(dated.body.posts.map((post: any) => post.message_id)).toEqual([5, 4]);
 
     const newer = await guest.read("@outside", { afterMessageId: 2, limit: 3 });
     expect(newer.posts.map((post) => post.messageId)).toEqual([5, 4, 3]);
-
-    const newerPage = await call("list_posts", { channel: "@outside", after_message_id: 2, limit: 3 });
-    expect(newerPage.body.posts.map((post: any) => post.message_id)).toEqual([5, 4]);
-    expect(newerPage.body.next_before_message_id).toBe(3);
 
     const range = await guest.read("@outside", { afterMessageId: 1, beforeMessageId: 5, limit: 10 });
     expect(range.posts.map((post) => post.messageId)).toEqual([4, 3, 2]);
@@ -207,7 +219,7 @@ describe("каналы вне пула", () => {
   it("list_posts отдаёт альбом одним постом и не выдаёт ссылки на несохранённые вложения", async () => {
     const response = await call("list_posts", { channel: "https://t.me/outside", limit: 3 });
     expect(response.status).toBe(200);
-    expect(response.body.posts.map((post: any) => post.message_id)).toEqual([5, 4]);
+    expect(response.body.posts.map((post: any) => post.message_id)).toEqual([5, 4, 2]);
     expect(response.body.posts[1].channel).toBeUndefined();
     expect(response.body.posts[1].channel_username).toBeUndefined();
     expect(response.body.notice).toBeUndefined();

@@ -36,6 +36,8 @@ export const GUEST_CACHE = {
 export interface HistoryParams {
   limit: number;
   offsetId?: number;
+  /** Unix-время в секундах: смотреть только сообщения старше него. */
+  offsetDate?: number;
   minId?: number;
   maxId?: number;
   reverse?: boolean;
@@ -87,6 +89,20 @@ export interface GuestPage {
   notice?: string;
 }
 
+export interface GuestEnsureOptions {
+  /** Сколько постов должно быть в кэше, чтобы страница с offset+limit поместилась. */
+  needed: number;
+  dateFrom?: Date;
+  dateTo?: Date;
+  mediaTypes?: readonly string[];
+}
+
+export interface GuestEnsureResult {
+  channel: Channel;
+  /** История закончилась или достигнута нижняя граница дат. */
+  complete: boolean;
+}
+
 export interface GuestPostResult {
   channel: Channel;
   post: Post;
@@ -107,6 +123,70 @@ export class GuestReader {
     this.store = store;
     this.source = source;
     this.options = options;
+  }
+
+  /**
+   * Догружает историю гостевого канала в кэш, чтобы дальше читать её тем же
+   * SQL-фильтром, что и канал пула: даты, offset и media_types.
+   */
+  async ensurePosts(ref: string, options: GuestEnsureOptions): Promise<GuestEnsureResult> {
+    this.assertPublic(ref);
+    const known = await this.store.findChannel(ref);
+    const cached = isFresh(known) ? known : undefined;
+    try {
+      const resolved = await this.source.resolve(ref, cached ?? undefined);
+      await this.store.trimGuestChannels(this.options.maxChannels);
+      const channel = await this.store.upsertGuestChannel(
+        { ...resolved, ref: known?.ref ?? ref },
+        this.options.ttlSeconds,
+      );
+
+      let offsetDate = options.dateTo ? Math.floor(options.dateTo.getTime() / 1_000) + 1 : undefined;
+      let offsetId: number | undefined;
+      let complete = false;
+      while (true) {
+        const batch = (await this.source.history(resolved.peer, {
+          limit: MAX_FETCH,
+          ...(offsetDate ? { offsetDate } : { offsetId }),
+        })).filter(isPost);
+        if (batch.length === 0) {
+          complete = true;
+          break;
+        }
+
+        await this.save(channel.id, await this.completeAlbums(resolved.peer, batch));
+
+        const { total } = await this.store.listPosts({
+          channelIds: [channel.id],
+          includeGuest: true,
+          from: options.dateFrom,
+          to: options.dateTo,
+          mediaTypes: options.mediaTypes,
+          order: "newest",
+          limit: 1,
+        });
+        if (total > options.needed) break;
+
+        // Дальше только старше date_from — остальное отфильтрует SQL.
+        const oldest = Math.min(...batch.map((message) => message.date ?? 0));
+        if (options.dateFrom && oldest * 1000 < options.dateFrom.getTime()) {
+          complete = true;
+          break;
+        }
+        if (batch.length < MAX_FETCH) {
+          complete = true;
+          break;
+        }
+
+        offsetDate = undefined;
+        offsetId = Math.min(...batch.map((message) => message.id));
+      }
+      return { channel, complete };
+    } catch (error) {
+      // Telegram недоступен, но в кэше уже что-то есть — отдадим его.
+      if (cached) return { channel: cached, complete: true };
+      throw error;
+    }
   }
 
   /** Лента канала вне пула; при недоступном Telegram отдаёт ещё живой кэш. */
