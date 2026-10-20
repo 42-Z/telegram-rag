@@ -106,7 +106,8 @@ export class Indexer {
    * запрос используют разные пределы, поэтому и ключи разные.
    */
   private saveOriginal(job: MediaJob, direct = false): Promise<SavedOriginal | undefined> {
-    const key = `${job.channelId}:${job.messageId}:${direct ? "direct" : "background"}`;
+    const source = job.media.fileId ?? mediaSourceFingerprint(job.media);
+    const key = `${job.channelId}:${job.messageId}:${source}:${direct ? "direct" : "background"}`;
     const running = this.originalTasks.get(key);
     if (running) return running;
     let task: Promise<SavedOriginal | undefined>;
@@ -165,7 +166,7 @@ export class Indexer {
       try {
         bytes = await storage.readOriginal(asset.objectKey);
       } catch (error) {
-        await this.store.markMediaStorageFailed(assetRef(job), String(error));
+        await this.store.markMediaStorageFailed(assetRef(job), String(error), { allowStored: true });
         throw new Error("не удалось прочитать ранее сохранённый оригинал из S3");
       }
       if (bytes.length > this.options.maxEmbedBytes) {

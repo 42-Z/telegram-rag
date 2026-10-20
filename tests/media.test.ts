@@ -9,7 +9,7 @@ import type { Embedder, EmbeddingInput } from "../src/embeddings.ts";
 import { Indexer, type IndexerOptions } from "../src/indexer.ts";
 import { presentPostMedia } from "../src/presentation.ts";
 import type { ObjectStorage, SaveOriginalInput, StoredOriginal } from "../src/storage.ts";
-import { normalizeMessage, type PostMedia } from "../src/telegram/normalize.ts";
+import { mediaSourceFingerprint, normalizeMessage, type PostMedia } from "../src/telegram/normalize.ts";
 import { fakeEmbedder, freshStore, message } from "./helpers.ts";
 
 // Подмена подготовки медиа нужна одному тесту: ffmpeg сложно заставить упасть на середине файла.
@@ -471,6 +471,36 @@ describe("direct media embedding pipeline", () => {
       expect(asset).toMatchObject({ storageStatus: "stored", embeddingStatus: "skipped" });
       expect(asset?.embeddingError).toMatch(/векторного поиска/);
       expect(objects.get(asset!.objectKey!)?.bytes).toEqual(photo);
+    } finally {
+      await db.close();
+    }
+  }, 30_000);
+
+  it("does not let a late parallel failure overwrite a stored original", async () => {
+    const { db, store } = await freshStore();
+    try {
+      await store.upsertChannel({ id: 9015, ref: "@race", username: "race", title: "Гонка", about: null, accessHash: "1" });
+      await store.upsertPosts([
+        normalizeMessage(9015, message(1, "Фото при гонке", { media: mediaFor("photo", 2, "image/png", 0, "photo.png") })),
+      ]);
+      const { storage } = makeStorage();
+      await new Indexer(store, fakeEmbedder(), indexerOptions(storage, async () => photo)).runOnce();
+      const post = (await store.getPost(9015, 1))!;
+      const reference = {
+        channelId: 9015,
+        messageId: 1,
+        sourceFileId: post.media?.fileId,
+        sourceFingerprint: mediaSourceFingerprint(post.media),
+      };
+
+      await store.markMediaStorageFailed(reference, "late download failure");
+      expect(await store.getMediaAsset(9015, 1)).toMatchObject({ storageStatus: "stored" });
+
+      await store.markMediaStorageSkipped(reference, "late skip");
+      expect(await store.getMediaAsset(9015, 1)).toMatchObject({ storageStatus: "stored" });
+
+      await store.markMediaStorageFailed(reference, "stored object is unreadable", { allowStored: true });
+      expect(await store.getMediaAsset(9015, 1)).toMatchObject({ storageStatus: "failed" });
     } finally {
       await db.close();
     }

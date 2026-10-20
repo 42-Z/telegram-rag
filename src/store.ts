@@ -595,15 +595,29 @@ export class Store {
     });
   }
 
+  /**
+   * Сбой загрузки не должен затирать оригинал, который успела сохранить
+   * параллельная загрузка. `allowStored` нужен только когда ошибка относится
+   * к чтению уже сохранённого объекта из S3.
+   */
   async markMediaStorageFailed(
     post: MediaAssetReference,
     error: string,
+    options: { allowStored?: boolean } = {},
   ): Promise<void> {
     await this.db.query(
       `UPDATE media_assets SET storage_status = 'failed', storage_error = $5, updated_at = now()
        WHERE channel_id = $1 AND message_id = $2
-         AND source_file_id IS NOT DISTINCT FROM $3 AND source_fingerprint = $4`,
-      [post.channelId, post.messageId, post.sourceFileId ?? null, post.sourceFingerprint, error.slice(0, 500)],
+         AND source_file_id IS NOT DISTINCT FROM $3 AND source_fingerprint = $4
+         AND (storage_status <> 'stored' OR $6::boolean)`,
+      [
+        post.channelId,
+        post.messageId,
+        post.sourceFileId ?? null,
+        post.sourceFingerprint,
+        error.slice(0, 500),
+        options.allowStored ?? false,
+      ],
     );
   }
 
@@ -614,7 +628,8 @@ export class Store {
     await this.db.query(
       `UPDATE media_assets SET storage_status = 'skipped', storage_error = $5, updated_at = now()
        WHERE channel_id = $1 AND message_id = $2
-         AND source_file_id IS NOT DISTINCT FROM $3 AND source_fingerprint = $4`,
+         AND source_file_id IS NOT DISTINCT FROM $3 AND source_fingerprint = $4
+         AND storage_status <> 'stored'`,
       [post.channelId, post.messageId, post.sourceFileId ?? null, post.sourceFingerprint, reason.slice(0, 500)],
     );
   }

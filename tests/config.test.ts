@@ -73,9 +73,10 @@ describe("S3 configuration", () => {
     expect(loadConfig({ ...validEnv, MEDIA_TYPES: "" }).embedding.modalities).toEqual(["image", "audio", "video"]);
   });
 
-  it("rejects the retired media limits instead of silently applying them", () => {
-    expect(() => loadConfig({ ...validEnv, MEDIA_MAX_MB: "20" })).toThrow(/MEDIA_MAX_MB is no longer configurable/);
-    expect(() => loadConfig({ ...validEnv, MEDIA_MAX_SECONDS: "1800" })).toThrow(/MEDIA_MAX_SECONDS is no longer configurable/);
+  it("ignores the retired media limits so old VPS env files keep starting", () => {
+    const config = loadConfig({ ...validEnv, MEDIA_MAX_MB: "20", MEDIA_MAX_SECONDS: "1800" });
+    expect(config).not.toHaveProperty("MEDIA_MAX_MB");
+    expect(config).not.toHaveProperty("MEDIA_MAX_SECONDS");
   });
 
   it("rejects malformed endpoints and invalid URL TTLs", () => {

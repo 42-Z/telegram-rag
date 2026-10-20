@@ -7,7 +7,8 @@ import { NodeHttpHandler } from "@smithy/node-http-handler";
 import type { AwsCredentialIdentity, AwsCredentialIdentityProvider } from "@smithy/types";
 
 const CONNECTION_TIMEOUT_MS = 5_000;
-const REQUEST_TIMEOUT_MS = 30_000;
+/** Простой соединения; общего requestTimeout нет — оригинал может идти дольше. */
+const SOCKET_TIMEOUT_MS = 120_000;
 const MAX_ATTEMPTS = 3;
 const OBJECT_KEY_PATTERN = /^sha256\/[a-f0-9]{64}$/;
 const FILENAME_METADATA_KEY = "filename";
@@ -195,9 +196,10 @@ class S3ObjectStorage implements ObjectStorage {
       responseChecksumValidation: "WHEN_REQUIRED",
       requestHandler: new NodeHttpHandler({
         connectionTimeout: CONNECTION_TIMEOUT_MS,
-        requestTimeout: REQUEST_TIMEOUT_MS,
-        socketTimeout: REQUEST_TIMEOUT_MS,
-        throwOnRequestTimeout: true,
+        // Большой оригинал передаётся минутами; общий таймаут оборвал бы его.
+        // Зависшее соединение ловит socketTimeout по отсутствию активности.
+        requestTimeout: 0,
+        socketTimeout: SOCKET_TIMEOUT_MS,
       }),
     });
   }

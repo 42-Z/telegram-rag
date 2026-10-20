@@ -112,6 +112,9 @@ PUBLIC_URL=https://telegram-rag.zomb.top
 EOF
 chmod 600 /etc/telegram-rag.env
 
+`MEDIA_MAX_MB` и `MEDIA_MAX_SECONDS` из старых установок можно удалить: сервис
+их игнорирует, запуск они не ломают.
+
 # 2. Переменные compose (не секреты).
 cat > .env <<'EOF'
 IMAGE_TAG=latest
