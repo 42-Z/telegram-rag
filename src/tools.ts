@@ -36,6 +36,8 @@ export interface ToolDef<S extends z.ZodObject = z.ZodObject> {
   description: string;
   /** По умолчанию инструмент только читает; get_post и list_posts пишут кэш и ходят в Telegram. */
   readOnly?: boolean;
+  /** Инструмент обращается к внешнему миру — Telegram. */
+  openWorld?: boolean;
   input: S;
   run(args: z.infer<S>, context: ToolContext): Promise<unknown>;
 }
@@ -59,7 +61,7 @@ const mediaTypesArg = z
       "paid_media, todo, video_stream, unsupported. Можно строкой или массивом",
   );
 
-const mediaTypeAliases: Record<string, string> = {
+const MEDIA_TYPE_ALIASES: Record<string, string> = {
   image: "photo",
   images: "photo",
   photo: "photo",
@@ -91,6 +93,34 @@ const mediaTypeAliases: Record<string, string> = {
   paidmedia: "paid_media",
 };
 
+const KNOWN_MEDIA_TYPES = new Set([
+  "photo",
+  "sticker",
+  "custom_emoji",
+  "document",
+  "voice",
+  "audio",
+  "video",
+  "video_note",
+  "gif",
+  "webpage",
+  "poll",
+  "geo",
+  "venue",
+  "geo_live",
+  "contact",
+  "dice",
+  "game",
+  "invoice",
+  "story",
+  "giveaway",
+  "giveaway_results",
+  "paid_media",
+  "todo",
+  "video_stream",
+  "unsupported",
+]);
+
 function normalizeMediaTypes(value: string | string[] | undefined): string[] | undefined {
   if (value === undefined) return undefined;
   const values = Array.isArray(value) ? value : [value];
@@ -98,19 +128,33 @@ function normalizeMediaTypes(value: string | string[] | undefined): string[] | u
     .flatMap((item) => item.split(","))
     .map((item) => item.trim().toLowerCase())
     .filter(Boolean)
-    .map((item) => mediaTypeAliases[item] ?? item);
+    .map((item) => MEDIA_TYPE_ALIASES[item] ?? item);
+  const unknown = [...new Set(types)].filter((type) => !KNOWN_MEDIA_TYPES.has(type));
+  if (unknown.length > 0) {
+    throw new ToolError(`неизвестные типы вложений: ${unknown.join(", ")}; допустимы: ${[...KNOWN_MEDIA_TYPES].join(", ")}`);
+  }
   return types.length > 0 ? [...new Set(types)] : undefined;
 }
 
 function parseDate(value: string | undefined, endOfDay: boolean): Date | undefined {
   if (!value) return undefined;
   const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(value);
-  const date = new Date(dateOnly && endOfDay ? `${value}T23:59:59.999Z` : value);
+  if (!dateOnly && !/^\d{4}-\d{2}-\d{2}T/.test(value)) throw new ToolError(`не дата: «${value}»`);
+  const normalized = dateOnly
+    ? `${value}T${endOfDay ? "23:59:59.999" : "00:00:00.000"}Z`
+    : /(?:Z|[+-]\d{2}:\d{2})$/.test(value) ? value : `${value}Z`;
+  const date = new Date(normalized);
   if (Number.isNaN(date.getTime())) throw new ToolError(`не дата: «${value}»`);
   return date;
 }
 
-export class ToolError extends Error {}
+export class ToolError extends Error {
+  readonly status: number;
+  constructor(message: string, status = 400) {
+    super(message);
+    this.status = status;
+  }
+}
 
 async function buildFilter(
   store: Store,
@@ -190,7 +234,7 @@ function compactMedia(media: PostMedia): Record<string, unknown> {
       if (media.sticker?.alt || media.sticker?.setName) {
         view.sticker = {
           ...(media.sticker.alt ? { alt: media.sticker.alt } : {}),
-          ...(media.sticker.setName ? { setName: media.sticker.setName } : {}),
+          ...(media.sticker.setName ? { set_name: media.sticker.setName } : {}),
         };
       }
       break;
@@ -200,7 +244,7 @@ function compactMedia(media: PostMedia): Record<string, unknown> {
           ...(media.webpage.url ? { url: media.webpage.url } : {}),
           ...(media.webpage.title ? { title: media.webpage.title } : {}),
           ...(media.webpage.description ? { description: media.webpage.description } : {}),
-          ...(media.webpage.siteName ? { siteName: media.webpage.siteName } : {}),
+          ...(media.webpage.siteName ? { site_name: media.webpage.siteName } : {}),
         };
       }
       break;
@@ -229,9 +273,9 @@ function compactMedia(media: PostMedia): Record<string, unknown> {
     case "contact":
       if (media.contact) {
         view.contact = {
-          ...(media.contact.firstName ? { firstName: media.contact.firstName } : {}),
-          ...(media.contact.lastName ? { lastName: media.contact.lastName } : {}),
-          ...(media.contact.phoneNumber ? { phoneNumber: media.contact.phoneNumber } : {}),
+          ...(media.contact.firstName ? { first_name: media.contact.firstName } : {}),
+          ...(media.contact.lastName ? { last_name: media.contact.lastName } : {}),
+          ...(media.contact.phoneNumber ? { phone_number: media.contact.phoneNumber } : {}),
         };
       }
       break;
@@ -257,7 +301,7 @@ function compactMedia(media: PostMedia): Record<string, unknown> {
           ...(media.invoice.title ? { title: media.invoice.title } : {}),
           ...(media.invoice.description ? { description: media.invoice.description } : {}),
           ...(media.invoice.currency ? { currency: media.invoice.currency } : {}),
-          ...(media.invoice.totalAmount !== undefined ? { totalAmount: media.invoice.totalAmount } : {}),
+          ...(media.invoice.totalAmount !== undefined ? { total_amount: media.invoice.totalAmount } : {}),
         };
       }
       break;
@@ -266,7 +310,7 @@ function compactMedia(media: PostMedia): Record<string, unknown> {
         view.story = {
           ...(media.story.id !== undefined ? { id: media.story.id } : {}),
           ...(media.story.caption ? { caption: media.story.caption } : {}),
-          ...(media.story.mediaType ? { mediaType: media.story.mediaType } : {}),
+          ...(media.story.mediaType ? { media_type: media.story.mediaType } : {}),
         };
       }
       break;
@@ -276,26 +320,26 @@ function compactMedia(media: PostMedia): Record<string, unknown> {
           ...(media.giveaway.quantity !== undefined ? { quantity: media.giveaway.quantity } : {}),
           ...(media.giveaway.months !== undefined ? { months: media.giveaway.months } : {}),
           ...(media.giveaway.stars !== undefined ? { stars: media.giveaway.stars } : {}),
-          ...(media.giveaway.prizeDescription ? { prizeDescription: media.giveaway.prizeDescription } : {}),
+          ...(media.giveaway.prizeDescription ? { prize_description: media.giveaway.prizeDescription } : {}),
           ...(media.giveaway.channels && media.giveaway.channels.length > 0 ? { channels: media.giveaway.channels } : {}),
-          ...(media.giveaway.untilDate !== undefined ? { untilDate: media.giveaway.untilDate } : {}),
+          ...(media.giveaway.untilDate !== undefined ? { until_date: media.giveaway.untilDate } : {}),
         };
       }
       break;
     case "giveaway_results":
       if (media.giveawayResults) {
-        view.giveawayResults = {
-          ...(media.giveawayResults.winnersCount !== undefined ? { winnersCount: media.giveawayResults.winnersCount } : {}),
-          ...(media.giveawayResults.unclaimedCount !== undefined ? { unclaimedCount: media.giveawayResults.unclaimedCount } : {}),
-          ...(media.giveawayResults.prizeDescription ? { prizeDescription: media.giveawayResults.prizeDescription } : {}),
+        view.giveaway_results = {
+          ...(media.giveawayResults.winnersCount !== undefined ? { winners_count: media.giveawayResults.winnersCount } : {}),
+          ...(media.giveawayResults.unclaimedCount !== undefined ? { unclaimed_count: media.giveawayResults.unclaimedCount } : {}),
+          ...(media.giveawayResults.prizeDescription ? { prize_description: media.giveawayResults.prizeDescription } : {}),
           ...(media.giveawayResults.winners && media.giveawayResults.winners.length > 0 ? { winners: media.giveawayResults.winners } : {}),
         };
       }
       break;
     case "paid_media": {
       const items = media.paidMedia?.items ?? [];
-      view.paidMedia = {
-        ...(media.paidMedia?.starsAmount !== undefined ? { starsAmount: media.paidMedia.starsAmount } : {}),
+      view.paid_media = {
+        ...(media.paidMedia?.starsAmount !== undefined ? { stars_amount: media.paidMedia.starsAmount } : {}),
         ...(items.length > 0
           ? {
               items: items.map((item) => ({
@@ -368,7 +412,7 @@ async function presentFeed(
 
 /** Посты канала из базы; offset считается по постам после свёртки альбомов. */
 async function collectDisplayedPosts(
-  store: Pick<Store, "listPosts" | "getAlbum">,
+  store: Pick<Store, "listPosts" | "getAlbum" | "countPosts">,
   channelId: number,
   options: {
     includeGuest: boolean;
@@ -379,27 +423,30 @@ async function collectDisplayedPosts(
     limit: number;
   },
 ): Promise<{ posts: Post[]; returned: number; exhausted: boolean }> {
+  const filter = {
+    channelIds: [channelId],
+    includeGuest: options.includeGuest,
+    from: options.from,
+    to: options.to,
+    mediaTypes: options.mediaTypes,
+  };
+  const total = await store.countPosts(filter);
   const target = options.offset + options.limit;
   const seenAlbums = new Set<string>();
   const selected: Post[] = [];
   let displayed = 0;
   let returned = 0;
   let rawOffset = 0;
-  let total = 0;
   let exhausted = false;
 
   while (displayed < target) {
     const page = await store.listPosts({
-      channelIds: [channelId],
-      includeGuest: options.includeGuest,
-      from: options.from,
-      to: options.to,
-      mediaTypes: options.mediaTypes,
+      ...filter,
       order: "newest",
       limit: 100,
       offset: rawOffset,
+      count: false,
     });
-    total = page.total;
     if (page.posts.length === 0) {
       exhausted = true;
       break;
@@ -407,19 +454,20 @@ async function collectDisplayedPosts(
     rawOffset += page.posts.length;
 
     for (const post of page.posts) {
+      const willSelect = displayed + 1 > options.offset && returned < options.limit;
       let entry: Post[];
       if (post.groupedId) {
         const key = `${post.channelId}:${post.groupedId}`;
         if (seenAlbums.has(key)) continue;
         seenAlbums.add(key);
-        entry = await store.getAlbum(post.channelId, post.groupedId);
+        entry = willSelect ? await store.getAlbum(post.channelId, post.groupedId) : [post];
         if (entry.length === 0) entry = [post];
       } else {
         entry = [post];
       }
 
       displayed += 1;
-      if (displayed > options.offset && returned < options.limit) {
+      if (willSelect) {
         selected.push(...entry);
         returned += 1;
       }
@@ -441,7 +489,10 @@ async function guestCall<T>(ref: string, work: () => Promise<T>): Promise<T> {
   } catch (error) {
     if (error instanceof ToolError) throw error;
     const message = error instanceof Error ? error.message : String(error);
-    throw new ToolError(`канал «${ref}» не прочитан: ${message}`);
+    const transient = /FLOOD_WAIT|FloodWait|flood wait|wait of \d+ seconds|TIMEOUT|ECONN|ENET|EHOST|socket|connection|не удалось подключиться/i.test(
+      message,
+    );
+    throw new ToolError(`канал «${ref}» не прочитан: ${message}`, transient ? 503 : 400);
   }
 }
 
@@ -580,6 +631,7 @@ export const TOOLS: ToolDef[] = [
       "ссылки на сохранённые вложения, все части альбома, пост, на который он отвечает, и соседние посты канала. " +
       "Недостающие оригиналы каналов пула догружает из Telegram; у каналов вне пула вложения не сохраняются.",
     readOnly: false,
+    openWorld: true,
     input: z.object({
       link: z.string().optional().describe("Ссылка вида https://t.me/<канал>/<id> или https://t.me/c/<id>/<id>"),
       channel: z.string().optional().describe("@имя, ссылка или id канала — если нет ссылки"),
@@ -675,8 +727,10 @@ export const TOOLS: ToolDef[] = [
       "каналов вне пула. Отдаёт message_id, link, date, text, media и album без просмотров, реакций, комментариев " +
       "и служебных полей вложений; подробности и скачивание — через get_post. " +
       "date_from и date_to включают границы, offset пропускает посты для следующей страницы, " +
-      "media_types оставляет только посты с документами, стикерами или другими указанными вложениями.",
+      "media_types оставляет только посты с документами, стикерами или другими указанными вложениями. " +
+      "На живой ленте фиксируйте date_to на время обхода, иначе новые посты сдвинут offset.",
     readOnly: false,
+    openWorld: true,
     input: z.object({
       channel: z.string().min(1).describe("@имя, ссылка https://t.me/<имя> или id канала"),
       date_from: dateFromArg,
@@ -700,6 +754,7 @@ export const TOOLS: ToolDef[] = [
       let channelId: number;
       let includeGuest = false;
       let complete = true;
+      let notice: string | undefined;
       let page: { posts: Post[]; returned: number; exhausted: boolean };
 
       if (channel && !channel.expiresAt) {
@@ -731,6 +786,7 @@ export const TOOLS: ToolDef[] = [
           );
           channelId = ensured.channel.id;
           complete = ensured.complete;
+          notice = ensured.notice;
           page = await collectDisplayedPosts(store, channelId, {
             includeGuest,
             from,
@@ -739,7 +795,7 @@ export const TOOLS: ToolDef[] = [
             offset,
             limit,
           });
-          if (page.returned >= limit || ensured.complete) break;
+          if (page.returned >= limit || ensured.complete || ensured.notice) break;
           needed *= 2;
         }
       }
@@ -750,6 +806,7 @@ export const TOOLS: ToolDef[] = [
         next_offset: page.returned >= limit && !(complete && page.exhausted)
           ? offset + page.returned
           : undefined,
+        ...(notice ? { notice } : {}),
       };
     },
   }),

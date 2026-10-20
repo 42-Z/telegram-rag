@@ -15,10 +15,12 @@ import { type MessageLike, describeMedia, isPost, normalizeMessage } from "./nor
 
 const log = logger("guest");
 
+export class GuestScanLimitError extends Error {}
+
 /** Сколько сообщений Telegram отдаёт за один запрос истории. */
 const MAX_FETCH = 100;
-/** Сколько сообщений просматривать в поисках нужного типа, чтобы не зависнуть. */
-const MEDIA_SCAN_LIMIT = 500;
+/** Предохранитель от чтения всей истории гостевого канала за один запрос. */
+const MAX_GUEST_SCAN_MESSAGES = 2_000;
 /** Запас по номерам сообщений вокруг края альбома. */
 const ALBUM_MARGIN = 10;
 /** Сколько соседних сообщений запрашивать вокруг альбома. */
@@ -47,7 +49,7 @@ export interface HistoryParams {
 export interface ChannelSource {
   resolve(
     ref: string,
-    known?: { id: number; accessHash: string | null; username: string | null },
+    known?: { id: number; accessHash: string | null; username: string | null; about?: string | null },
   ): Promise<ResolvedChannel>;
   history(peer: ResolvedChannel["peer"], params: HistoryParams): Promise<MessageLike[]>;
   message(peer: ResolvedChannel["peer"], id: number): Promise<MessageLike | undefined>;
@@ -70,25 +72,6 @@ export interface GuestReaderOptions {
   maxChannels: number;
 }
 
-export interface GuestReadOptions {
-  limit: number;
-  beforeMessageId?: number;
-  afterMessageId?: number;
-  order?: "newest" | "oldest";
-  /** Только посты с вложениями этих типов. */
-  mediaTypes?: readonly string[];
-}
-
-export interface GuestPage {
-  channel: Channel;
-  posts: Post[];
-  hasMore: boolean;
-  nextBeforeMessageId?: number;
-  nextAfterMessageId?: number;
-  fromCache: boolean;
-  notice?: string;
-}
-
 export interface GuestEnsureOptions {
   /** Сколько постов должно быть в кэше, чтобы страница с offset+limit поместилась. */
   needed: number;
@@ -101,6 +84,7 @@ export interface GuestEnsureResult {
   channel: Channel;
   /** История закончилась или достигнута нижняя граница дат. */
   complete: boolean;
+  notice?: string;
 }
 
 export interface GuestPostResult {
@@ -118,6 +102,7 @@ export class GuestReader {
   private readonly store: Store;
   private readonly source: ChannelSource;
   private readonly options: GuestReaderOptions;
+  private readonly ensureQueues = new Map<string, Promise<unknown>>();
 
   constructor(store: Store, source: ChannelSource, options: GuestReaderOptions) {
     this.store = store;
@@ -130,6 +115,17 @@ export class GuestReader {
    * SQL-фильтром, что и канал пула: даты, offset и media_types.
    */
   async ensurePosts(ref: string, options: GuestEnsureOptions): Promise<GuestEnsureResult> {
+    const previous = this.ensureQueues.get(ref) ?? Promise.resolve();
+    const task = previous.catch(() => {}).then(() => this.ensurePostsWork(ref, options));
+    this.ensureQueues.set(ref, task);
+    try {
+      return await task;
+    } finally {
+      if (this.ensureQueues.get(ref) === task) this.ensureQueues.delete(ref);
+    }
+  }
+
+  private async ensurePostsWork(ref: string, options: GuestEnsureOptions): Promise<GuestEnsureResult> {
     this.assertPublic(ref);
     const known = await this.store.findChannel(ref);
     const cached = isFresh(known) ? known : undefined;
@@ -144,115 +140,63 @@ export class GuestReader {
       let offsetDate = options.dateTo ? Math.floor(options.dateTo.getTime() / 1_000) + 1 : undefined;
       let offsetId: number | undefined;
       let complete = false;
+      let matched = 0;
+      let scanned = 0;
       while (true) {
-        const batch = (await this.source.history(resolved.peer, {
+        const raw = await this.source.history(resolved.peer, {
           limit: MAX_FETCH,
           ...(offsetDate ? { offsetDate } : { offsetId }),
-        })).filter(isPost);
-        if (batch.length === 0) {
-          complete = true;
-          break;
-        }
-
-        await this.save(channel.id, await this.completeAlbums(resolved.peer, batch));
-
-        const { total } = await this.store.listPosts({
-          channelIds: [channel.id],
-          includeGuest: true,
-          from: options.dateFrom,
-          to: options.dateTo,
-          mediaTypes: options.mediaTypes,
-          order: "newest",
-          limit: 1,
         });
-        if (total > options.needed) break;
-
-        // Дальше только старше date_from — остальное отфильтрует SQL.
-        const oldest = Math.min(...batch.map((message) => message.date ?? 0));
-        if (options.dateFrom && oldest * 1000 < options.dateFrom.getTime()) {
+        if (raw.length === 0) {
           complete = true;
           break;
         }
-        if (batch.length < MAX_FETCH) {
+        scanned += raw.length;
+
+        const posts = raw.filter(isPost);
+        await this.save(channel.id, await this.completeAlbums(resolved.peer, posts));
+
+        // Считаем совпадения по самой истории Telegram, а не по кэшу:
+        // в кэше могут быть дыры от get_post и прошлых запросов с датами.
+        for (const message of posts) {
+          const date = (message.date ?? 0) * 1_000;
+          if (options.dateFrom && date < options.dateFrom.getTime()) continue;
+          if (options.dateTo && date > options.dateTo.getTime()) continue;
+          const type = describeMedia(message.media)?.type;
+          if (options.mediaTypes && (!type || !options.mediaTypes.includes(type))) continue;
+          matched += 1;
+        }
+        if (matched >= options.needed) break;
+
+        const oldest = Math.min(...raw.map((message) => message.date ?? 0));
+        if (options.dateFrom && oldest * 1_000 < options.dateFrom.getTime()) {
+          complete = true;
+          break;
+        }
+        if (scanned >= MAX_GUEST_SCAN_MESSAGES) {
+          throw new GuestScanLimitError(
+            `история канала слишком глубокая: просмотрено ${scanned} сообщений, но нужного количества постов не набралось. ` +
+              "Уточните date_from или date_to",
+          );
+        }
+        if (raw.length < MAX_FETCH) {
           complete = true;
           break;
         }
 
         offsetDate = undefined;
-        offsetId = Math.min(...batch.map((message) => message.id));
+        offsetId = Math.min(...raw.map((message) => message.id));
       }
       return { channel, complete };
     } catch (error) {
+      if (error instanceof GuestScanLimitError) throw error;
       // Telegram недоступен, но в кэше уже что-то есть — отдадим его.
-      if (cached) return { channel: cached, complete: true };
-      throw error;
-    }
-  }
-
-  /** Лента канала вне пула; при недоступном Telegram отдаёт ещё живой кэш. */
-  async read(ref: string, options: GuestReadOptions): Promise<GuestPage> {
-    this.assertPublic(ref);
-    const known = await this.store.findChannel(ref);
-    const cached = isFresh(known) ? known : undefined;
-    try {
-      const resolved = await this.source.resolve(ref, cached ?? undefined);
-      await this.store.trimGuestChannels(this.options.maxChannels);
-      const channel = await this.store.upsertGuestChannel(
-        { ...resolved, ref: known?.ref ?? ref },
-        this.options.ttlSeconds,
-      );
-
-      const limit = options.limit;
-      const mediaTypes = options.mediaTypes && options.mediaTypes.length > 0 ? options.mediaTypes : undefined;
-      let page: MessageLike[];
-      let hasMore: boolean;
-      let nextBeforeMessageId: number | undefined;
-      let nextAfterMessageId: number | undefined;
-
-      if (!mediaTypes) {
-        const fetched = (await this.source.history(resolved.peer, this.historyParams(options, Math.min(MAX_FETCH, limit + 1))))
-          .filter(isPost);
-        page = fetched.slice(0, limit);
-        hasMore = fetched.length > page.length || (limit >= MAX_FETCH && fetched.length >= MAX_FETCH);
-        nextBeforeMessageId = page.length > 0 ? Math.min(...page.map((message) => message.id)) : undefined;
-        nextAfterMessageId = options.afterMessageId !== undefined && page.length > 0
-          ? Math.max(...page.map((message) => message.id))
-          : undefined;
-      } else {
-        const scanned = await this.scanByMediaTypes(resolved.peer, options, limit, mediaTypes);
-        page = scanned.messages;
-        hasMore = scanned.hasMore;
-        nextBeforeMessageId = scanned.nextBeforeMessageId;
-        nextAfterMessageId = scanned.nextAfterMessageId;
-      }
-
-      const complete = await this.completeAlbums(resolved.peer, page);
-      await this.save(channel.id, complete);
-
-      const posts = await this.orderedPosts(channel.id, complete, options.order ?? "newest");
-      return {
-        channel,
-        posts,
-        hasMore,
-        nextBeforeMessageId: complete.length > 0
-          ? Math.min(nextBeforeMessageId ?? Number.MAX_SAFE_INTEGER, ...complete.map((message) => message.id))
-          : nextBeforeMessageId,
-        nextAfterMessageId: options.afterMessageId !== undefined && complete.length > 0
-          ? Math.max(nextAfterMessageId ?? 0, ...complete.map((message) => message.id))
-          : nextAfterMessageId,
-        fromCache: false,
-      };
-    } catch (error) {
       if (cached) {
-        const page = await this.cachedPage(cached, options);
-        if (page.posts.length > 0) {
-          log.warn(`Telegram не ответил, отдаю кэш ${cached.title}`, error);
-          return {
-            ...page,
-            fromCache: true,
-            notice: `Telegram сейчас недоступен — показан сохранённый кэш канала до ${iso(cached.expiresAt)}`,
-          };
-        }
+        return {
+          channel: cached,
+          complete: false,
+          notice: "Telegram недоступен — показан сохранённый кэш канала",
+        };
       }
       throw error;
     }
@@ -371,83 +315,6 @@ export class GuestReader {
     }
   }
 
-  /** Сканирует историю страницами, пока не наберёт `limit` постов нужных типов. */
-  private async scanByMediaTypes(
-    peer: ResolvedChannel["peer"],
-    options: GuestReadOptions,
-    limit: number,
-    mediaTypes: readonly string[],
-  ): Promise<{ messages: MessageLike[]; hasMore: boolean; nextBeforeMessageId?: number; nextAfterMessageId?: number }> {
-    const forward = options.afterMessageId !== undefined;
-    let before = options.beforeMessageId;
-    let after = options.afterMessageId;
-    let nextBeforeMessageId: number | undefined;
-    let nextAfterMessageId: number | undefined;
-    let scanned = 0;
-    let hasMore = false;
-    const matches: MessageLike[] = [];
-
-    while (scanned < MEDIA_SCAN_LIMIT && matches.length < limit) {
-      const batch = (await this.source.history(peer, {
-        limit: MAX_FETCH,
-        ...(forward
-          ? { minId: after, maxId: before, reverse: true }
-          : { offsetId: before }),
-      })).filter(isPost);
-      if (batch.length === 0) break;
-      scanned += batch.length;
-      for (const message of batch) {
-        const type = describeMedia(message.media)?.type;
-        if (type && mediaTypes.includes(type)) matches.push(message);
-      }
-      hasMore = batch.length >= MAX_FETCH || matches.length > limit;
-      if (forward) {
-        nextAfterMessageId = Math.max(...batch.map((message) => message.id));
-        after = nextAfterMessageId;
-      } else {
-        nextBeforeMessageId = Math.min(...batch.map((message) => message.id));
-        before = nextBeforeMessageId;
-      }
-      if (batch.length < MAX_FETCH) break;
-    }
-
-    const limited = matches.slice(0, limit);
-    if (matches.length > limit) {
-      if (forward) nextAfterMessageId = limited[limited.length - 1]!.id;
-      else nextBeforeMessageId = limited[limited.length - 1]!.id;
-    }
-
-    return {
-      messages: limited,
-      hasMore,
-      nextBeforeMessageId: forward ? undefined : nextBeforeMessageId,
-      nextAfterMessageId: forward ? nextAfterMessageId : undefined,
-    };
-  }
-
-  /** Посты из ещё живого кэша; для запасного пути, когда Telegram недоступен. */
-  private async cachedPage(channel: Channel, options: GuestReadOptions): Promise<GuestPage> {
-    const { posts, total } = await this.store.listPosts({
-      channelIds: [channel.id],
-      includeGuest: true,
-      mediaTypes: options.mediaTypes,
-      beforeMessageId: options.beforeMessageId,
-      afterMessageId: options.afterMessageId,
-      order: options.order ?? "newest",
-      limit: options.limit,
-    });
-    return {
-      channel,
-      posts,
-      hasMore: total > posts.length,
-      nextBeforeMessageId: posts.length > 0 ? Math.min(...posts.map((post) => post.messageId)) : undefined,
-      nextAfterMessageId: options.afterMessageId !== undefined && posts.length > 0
-        ? Math.max(...posts.map((post) => post.messageId))
-        : undefined,
-      fromCache: true,
-    };
-  }
-
   private async cachedPost(channel: Channel, messageId: number, context = 0): Promise<GuestPostResult | undefined> {
     const post = await this.store.getPost(channel.id, messageId);
     if (!post || post.deleted) return undefined;
@@ -489,35 +356,10 @@ export class GuestReader {
     };
   }
 
-  private historyParams(options: GuestReadOptions, limit: number): HistoryParams {
-    if (options.afterMessageId !== undefined) {
-      return {
-        limit,
-        minId: options.afterMessageId,
-        maxId: options.beforeMessageId,
-        reverse: true,
-      };
-    }
-    return {
-      limit,
-      offsetId: options.beforeMessageId,
-    };
-  }
-
   private async save(channelId: number, messages: readonly MessageLike[]): Promise<void> {
     if (messages.length === 0) return;
     const unique = [...new Map(messages.map((message) => [message.id, message])).values()];
     await this.store.upsertPosts(unique.map((message) => normalizeMessage(channelId, message)));
-  }
-
-  private async orderedPosts(channelId: number, messages: readonly MessageLike[], order: "newest" | "oldest"): Promise<Post[]> {
-    const ids = [...new Set(messages.map((message) => message.id))];
-    const posts = await this.store.getPosts(channelId, ids);
-    const byId = new Map(posts.map((post) => [post.messageId, post]));
-    return ids
-      .map((id) => byId.get(id))
-      .filter((post): post is Post => Boolean(post))
-      .sort((a, b) => order === "oldest" ? a.messageId - b.messageId : b.messageId - a.messageId);
   }
 
   /**

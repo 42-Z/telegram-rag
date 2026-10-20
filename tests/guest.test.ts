@@ -92,14 +92,13 @@ const call = async (name: string, args: unknown) => {
 
 describe("каналы вне пула", () => {
   it("читает ленту из Telegram и сохраняет её во временный кэш", async () => {
-    const page = await guest.read("@outside", { limit: 3 });
-    expect(page.fromCache).toBe(false);
-    expect(page.posts.map((post) => post.messageId)).toEqual([5, 4, 3]);
-    expect(page.channel).toMatchObject({ id: CHANNEL_ID, username: "outside", title: "Вне пула" });
-    expect(page.channel.expiresAt).toBeInstanceOf(Date);
-    expect(page.channel.expiresAt!.getTime()).toBeGreaterThan(Date.now());
-    expect(page.hasMore).toBe(true);
-    expect(page.nextBeforeMessageId).toBe(3);
+    const page = await call("list_posts", { channel: "@outside", limit: 5 });
+    expect(page.status).toBe(200);
+    expect(page.body.posts.map((post: any) => post.message_id)).toEqual([5, 4, 2, 1]);
+    const channel = await store.findChannel("@outside");
+    expect(channel).toMatchObject({ id: CHANNEL_ID, username: "outside", title: "Вне пула" });
+    expect(channel!.expiresAt).toBeInstanceOf(Date);
+    expect(channel!.expiresAt!.getTime()).toBeGreaterThan(Date.now());
 
     // В обычную ленту, статистику и очередь индексации гости не попадают.
     expect((await store.listPosts({ limit: 10 })).total).toBe(0);
@@ -134,12 +133,6 @@ describe("каналы вне пула", () => {
       date_to: "2026-09-01T17:00:00Z",
     });
     expect(dated.body.posts.map((post: any) => post.message_id)).toEqual([5, 4]);
-
-    const newer = await guest.read("@outside", { afterMessageId: 2, limit: 3 });
-    expect(newer.posts.map((post) => post.messageId)).toEqual([5, 4, 3]);
-
-    const range = await guest.read("@outside", { afterMessageId: 1, beforeMessageId: 5, limit: 10 });
-    expect(range.posts.map((post) => post.messageId)).toEqual([4, 3, 2]);
   });
 
   it("фильтрует документы во внешнем канале, не теряя страницу", async () => {
@@ -176,28 +169,49 @@ describe("каналы вне пула", () => {
       }),
     ]);
     const docsReader = new GuestReader(store, docsSource, { ttlSeconds: 3600, maxChannels: 10 });
+    const docsApp = createApp({ context: { store, embedder: fakeEmbedder(), guests: docsReader } });
+    const docsCall = async (args: unknown) => {
+      const response = await docsApp.request("/api/tools/list_posts", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(args),
+      });
+      return { status: response.status, body: (await response.json()) as any };
+    };
 
-    const first = await docsReader.read("@docs", { limit: 1, mediaTypes: ["document"] });
-    expect(first.posts.map((post) => post.messageId)).toEqual([4]);
-    expect(first.nextBeforeMessageId).toBe(4);
+    const first = await docsCall({ channel: "@docs", media_types: ["document"], limit: 1 });
+    expect(first.body.posts.map((post: any) => post.message_id)).toEqual([4]);
+    expect(first.body.next_offset).toBe(1);
 
-    const second = await docsReader.read("@docs", {
+    const second = await docsCall({
+      channel: "@docs",
+      media_types: ["document"],
       limit: 5,
-      mediaTypes: ["document"],
-      beforeMessageId: first.nextBeforeMessageId,
+      offset: first.body.next_offset,
     });
-    expect(second.posts.map((post) => post.messageId)).toEqual([2]);
+    expect(second.body.posts.map((post: any) => post.message_id)).toEqual([2]);
   });
 
-  it("дочитывает альбом, обрезанный краем страницы", async () => {
-    const page = await guest.read("@outside", { limit: 1 });
-    expect(page.posts.map((post) => post.messageId)).toEqual([5]);
-    expect(page.hasMore).toBe(true);
+  it("не обрывает историю на служебных сообщениях", async () => {
+    const manyEntity: ResolvedChannel = {
+      id: 5003,
+      username: "many",
+      title: "Много постов",
+      about: null,
+      accessHash: "44",
+      peer: new Api.InputPeerChannel({ channelId: bigInt(5003), accessHash: bigInt(44) }),
+    };
+    const items: MessageLike[] = Array.from({ length: 150 }, (_, index) => message(index + 1, `Пост ${index + 1}`));
+    items[99] = { ...message(100, ""), className: "MessageService", action: {} };
+    const manyReader = new GuestReader(store, new FakeSource(manyEntity, "many", items), {
+      ttlSeconds: 3600,
+      maxChannels: 10,
+    });
 
-    const last = await guest.read("@outside", { limit: 2 });
-    expect(last.posts.map((post) => post.messageId)).toEqual([5, 4, 3]);
-    const older = await guest.read("@outside", { beforeMessageId: 5, limit: 1 });
-    expect(older.posts.map((post) => post.messageId).sort()).toEqual([3, 4]);
+    const ensured = await manyReader.ensurePosts("@many", { needed: 105 });
+    expect(ensured.complete).toBe(false);
+    const { total } = await store.listPosts({ channelIds: [manyEntity.id], includeGuest: true, limit: 1 });
+    expect(total).toBe(149);
   });
 
   it("get_post собирает альбом, ответ и соседей", async () => {
@@ -244,10 +258,9 @@ describe("каналы вне пула", () => {
 
   it("без Telegram отдаёт ещё живой кэш", async () => {
     source.fail = true;
-    const page = await guest.read("@outside", { limit: 2 });
-    expect(page.fromCache).toBe(true);
-    expect(page.posts.map((post) => post.messageId)).toEqual([5, 4]);
-    expect(page.notice).toContain("кэш");
+    const fallback = await call("list_posts", { channel: "@outside", limit: 2 });
+    expect(fallback.body.posts.map((post: any) => post.message_id)).toEqual([5, 4]);
+    expect(fallback.body.notice).toContain("Telegram недоступен");
 
     const result = await guest.getPost("@outside", 4, { context: 0 });
     expect(result?.fromCache).toBe(true);
@@ -264,7 +277,7 @@ describe("каналы вне пула", () => {
     const other = await freshStore();
     try {
       const limited = new GuestReader(other.store, source, { ttlSeconds: 3600, maxChannels: 1 });
-      await limited.read("@outside", { limit: 1 });
+      await limited.ensurePosts("@outside", { needed: 1 });
       await other.store.upsertGuestChannel({
         id: 5002, ref: "@second", username: "second", title: "Второй", about: null, accessHash: "2",
       }, 3600);

@@ -95,7 +95,7 @@ export function createApp(options: AppOptions): Hono {
   const { context, ingestor } = options;
 
   app.onError((error, c) => {
-    if (error instanceof ToolError) return c.json({ error: error.message }, 400);
+    if (error instanceof ToolError) return c.json({ error: error.message }, error.status as 400);
     log.error(`${c.req.method} ${c.req.path}`, error);
     return c.json({ error: "внутренняя ошибка" }, 500);
   });

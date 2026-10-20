@@ -298,6 +298,7 @@ CREATE TABLE IF NOT EXISTS media_assets (
 ALTER TABLE media_assets ADD COLUMN IF NOT EXISTS source_fingerprint text;
 
 CREATE INDEX IF NOT EXISTS posts_channel_date ON posts (channel_id, date DESC);
+CREATE INDEX IF NOT EXISTS posts_channel_date_id ON posts (channel_id, date DESC, message_id DESC);
 CREATE INDEX IF NOT EXISTS posts_date ON posts (date DESC);
 CREATE INDEX IF NOT EXISTS posts_tsv ON posts USING gin (tsv);
 CREATE INDEX IF NOT EXISTS posts_grouped ON posts (channel_id, grouped_id) WHERE grouped_id IS NOT NULL;

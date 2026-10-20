@@ -168,7 +168,7 @@ describe("типы сообщений", () => {
     expect(list.posts[0].date).not.toContain(".");
     expect(byId.get(1).media).toMatchObject({
       type: "sticker",
-      sticker: { alt: "😺", setName: "Cats" },
+      sticker: { alt: "😺", set_name: "Cats" },
     });
     expect(byId.get(1).media).not.toHaveProperty("file_name");
     expect(byId.get(1).media).not.toHaveProperty("storage_status");
@@ -183,15 +183,15 @@ describe("типы сообщений", () => {
     expect(byId.get(2).media).not.toHaveProperty("url");
     expect(byId.get(3).media).toMatchObject({
       type: "giveaway",
-      giveaway: { quantity: 3, prizeDescription: "Подписка", channels: ["5"] },
+      giveaway: { quantity: 3, prize_description: "Подписка", channels: ["5"] },
     });
     expect(byId.get(4).media).toMatchObject({
       type: "contact",
-      contact: { firstName: "Иван", lastName: "Петров", phoneNumber: "+7 999 123-45-67" },
+      contact: { first_name: "Иван", last_name: "Петров", phone_number: "+7 999 123-45-67" },
     });
     expect(byId.get(6).media).toMatchObject({
       type: "paid_media",
-      paidMedia: { starsAmount: 50, items: [{ preview: true, duration: 5 }] },
+      paid_media: { stars_amount: 50, items: [{ preview: true, duration: 5 }] },
     });
   });
 
@@ -209,6 +209,33 @@ describe("типы сообщений", () => {
       context,
     )) as any;
     expect(stickers.posts.map((post: any) => post.message_id).sort()).toEqual([1, 3]);
+
+    await expect(
+      callTool("list_posts", { channel: "@types", media_types: ["pdf"] }, context),
+    ).rejects.toThrow(/неизвестные типы/);
+  });
+
+  it("не превращает отключённый канал пула в гостя", async () => {
+    const poolChannel = await store.upsertChannel({
+      id: 9600,
+      ref: "@disabled",
+      username: "disabled",
+      title: "Отключённый пул",
+      about: null,
+      accessHash: "1",
+    });
+    await store.disableChannel(poolChannel.id, false);
+    const guest = await store.upsertGuestChannel({
+      id: poolChannel.id,
+      ref: poolChannel.ref,
+      username: poolChannel.username,
+      title: poolChannel.title,
+      about: poolChannel.about,
+      accessHash: poolChannel.accessHash,
+    }, 3600);
+    expect(guest.expiresAt).toBeNull();
+    await store.purgeExpiredGuestChannels();
+    expect(await store.findChannel("@disabled")).toMatchObject({ id: poolChannel.id, expiresAt: null });
   });
 
   it("не ищет стикеры, раздачи и платные посты, но ищет остальные", async () => {

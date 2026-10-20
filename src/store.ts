@@ -250,7 +250,7 @@ export class Store {
          about = COALESCE(EXCLUDED.about, channels.about),
          access_hash = COALESCE(EXCLUDED.access_hash, channels.access_hash),
          expires_at = CASE
-           WHEN channels.expires_at IS NULL AND channels.enabled THEN NULL
+           WHEN channels.expires_at IS NULL THEN NULL
            ELSE now() + $7::int * interval '1 second'
          END
        RETURNING ${CHANNEL_COLUMNS}`,
@@ -323,7 +323,8 @@ export class Store {
     const id = /^-?\d+$/.test(value) ? Number(value.replace(/^-100/, "")) : null;
     const [row] = await this.db.query<Channel>(
       `SELECT ${CHANNEL_COLUMNS} FROM channels
-       WHERE id = $1 OR lower(username) = lower($2) OR ref = $3 LIMIT 1`,
+       WHERE id = $1 OR lower(username) = lower($2) OR ref = $3
+       ORDER BY (expires_at IS NULL) DESC, enabled DESC LIMIT 1`,
       [id ?? -1, username, value],
     );
     return row;
@@ -439,16 +440,30 @@ export class Store {
   }
 
   /** Лента постов: по времени или по номерам сообщений, с перелистыванием. */
+  async countPosts(filter: PostFilter): Promise<number> {
+    const params: unknown[] = [];
+    const where = filterSql(filter, params);
+    const [row] = await this.db.query<{ total: number }>(
+      `SELECT count(*)::int AS total FROM posts p JOIN channels c ON c.id = p.channel_id WHERE ${where}`,
+      params,
+    );
+    return row?.total ?? 0;
+  }
+
   async listPosts(
-    filter: PostFilter & { order?: "newest" | "oldest"; limit: number; offset?: number },
+    filter: PostFilter & { order?: "newest" | "oldest"; limit: number; offset?: number; count?: boolean },
   ): Promise<{ posts: Post[]; total: number }> {
     const params: unknown[] = [];
     const where = filterSql(filter, params);
     const direction = filter.order === "oldest" ? "ASC" : "DESC";
-    const [count] = await this.db.query<{ total: number }>(
-      `SELECT count(*)::int AS total FROM posts p JOIN channels c ON c.id = p.channel_id WHERE ${where}`,
-      params,
-    );
+    let total = 0;
+    if (filter.count !== false) {
+      const [count] = await this.db.query<{ total: number }>(
+        `SELECT count(*)::int AS total FROM posts p JOIN channels c ON c.id = p.channel_id WHERE ${where}`,
+        params,
+      );
+      total = count?.total ?? 0;
+    }
     params.push(filter.limit, filter.offset ?? 0);
     const rows = await this.db.query<PostRow>(
       `SELECT ${POST_COLUMNS} FROM posts p JOIN channels c ON c.id = p.channel_id
@@ -457,7 +472,7 @@ export class Store {
        LIMIT $${params.length - 1} OFFSET $${params.length}`,
       params,
     );
-    return { posts: rows.map(withLink), total: count?.total ?? 0 };
+    return { posts: rows.map(withLink), total };
   }
 
   // ── индексация ──────────────────────────────────────────────────────────
