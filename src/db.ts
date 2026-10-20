@@ -225,8 +225,12 @@ CREATE TABLE IF NOT EXISTS channels (
   last_message_id   integer NOT NULL DEFAULT 0,
   backfill_done     boolean NOT NULL DEFAULT false,
   added_at          timestamptz NOT NULL DEFAULT now(),
-  synced_at         timestamptz
+  synced_at         timestamptz,
+  -- Канал вне пула: NULL — обычный канал пула, иначе срок удаления кэша.
+  expires_at        timestamptz
 );
+ALTER TABLE channels ADD COLUMN IF NOT EXISTS expires_at timestamptz;
+CREATE INDEX IF NOT EXISTS channels_guest_expiry ON channels (expires_at) WHERE expires_at IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS posts (
   channel_id      bigint NOT NULL REFERENCES channels(id) ON DELETE CASCADE,

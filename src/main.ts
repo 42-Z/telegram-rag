@@ -13,6 +13,7 @@ import { createObjectStorage } from "./storage.ts";
 import { Store } from "./store.ts";
 import { createClient } from "./telegram/client.ts";
 import { Ingestor } from "./telegram/ingest.ts";
+import { GUEST_CACHE, GuestReader, createChannelSource } from "./telegram/reader.ts";
 
 const log = logger("main");
 const config = loadConfig();
@@ -74,6 +75,7 @@ if (archiveOnly.length > 0) {
 
 let ingestor: Ingestor | undefined;
 let indexer: Indexer | undefined;
+let guests: GuestReader | undefined;
 if (config.telegramEnabled) {
   const client = createClient({
     apiId: config.TELEGRAM_API_ID!,
@@ -85,7 +87,29 @@ if (config.telegramEnabled) {
     pollIntervalSeconds: config.POLL_INTERVAL_SECONDS,
     onPosts: () => indexer?.notify(),
   });
+  guests = new GuestReader(store, createChannelSource(client), {
+    ttlSeconds: GUEST_CACHE.ttlSeconds,
+    maxChannels: GUEST_CACHE.maxChannels,
+  });
 }
+
+// Каналы вне пула — временный кэш: истёкшие удаляются вместе с постами,
+// а если кэш вырос больше лимита, первыми уходят давно не читанные.
+const GUEST_CLEANUP_MS = 60_000;
+async function purgeGuests(): Promise<void> {
+  try {
+    const purged = await store.purgeExpiredGuestChannels();
+    const trimmed = await store.trimGuestChannels(GUEST_CACHE.maxChannels);
+    if (purged + trimmed > 0) {
+      log.info(`каналы вне пула: удалено истёкших ${purged}, сверх лимита ${trimmed}`);
+    }
+  } catch (error) {
+    log.warn("не удалось удалить истёкший кэш каналов вне пула", error);
+  }
+}
+void purgeGuests();
+const guestCleanup = setInterval(() => void purgeGuests(), GUEST_CLEANUP_MS);
+guestCleanup.unref();
 
 const source = ingestor;
 indexer = new Indexer(store, embedder, {
@@ -131,6 +155,7 @@ const app = createApp({
     storage,
     mediaTypes: MEDIA_TYPES,
     ensureMedia: (post) => indexer!.ensureOriginal(post),
+    guests,
   },
   mediaTypes: MEDIA_TYPES,
   ingestor,
@@ -159,6 +184,7 @@ async function shutdown(signal: string) {
     process.exit(1);
   }, SHUTDOWN_TIMEOUT_MS).unref();
   server.close();
+  clearInterval(guestCleanup);
   await indexer?.stop().catch(() => {});
   await ingestor?.stop().catch(() => {});
   await storage.close().catch(() => {});

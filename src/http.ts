@@ -67,7 +67,7 @@ export function openApiDocument(baseUrl: string) {
     info: {
       title: "telegram-rag",
       version: SERVER_VERSION,
-      description: "Посты Telegram-каналов пула: поиск по смыслу и словам, лента, пост целиком.",
+      description: "Посты Telegram-каналов: пул с поиском и лентой, любой публичный канал по запросу.",
     },
     servers: [{ url: baseUrl }],
     components: { securitySchemes: { bearer: { type: "http", scheme: "bearer" } } },
@@ -175,13 +175,15 @@ export function createApp(options: AppOptions): Hono {
 
   // ── управление пулом ────────────────────────────────────────────────────
 
-  app.get("/api/admin/channels", adminAuth, async (c) =>
-    c.json({
-      channels: await context.store.listChannels({ includeDisabled: true }),
+  app.get("/api/admin/channels", adminAuth, async (c) => {
+    const all = await context.store.listChannels({ includeDisabled: true, includeGuest: true });
+    return c.json({
+      channels: all.filter((channel) => !channel.expiresAt),
+      guests: all.filter((channel) => channel.expiresAt),
       index: await context.store.indexStats(options.mediaTypes ?? []),
       media: await context.store.mediaStats(options.mediaTypes ?? []),
-    }),
-  );
+    });
+  });
 
   app.post("/api/admin/channels", adminAuth, async (c) => {
     const body = (await jsonBody(c)) as { ref?: string; refs?: string[] };
