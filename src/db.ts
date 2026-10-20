@@ -225,8 +225,12 @@ CREATE TABLE IF NOT EXISTS channels (
   last_message_id   integer NOT NULL DEFAULT 0,
   backfill_done     boolean NOT NULL DEFAULT false,
   added_at          timestamptz NOT NULL DEFAULT now(),
-  synced_at         timestamptz
+  synced_at         timestamptz,
+  -- Канал вне пула: NULL — обычный канал пула, иначе срок удаления кэша.
+  expires_at        timestamptz
 );
+ALTER TABLE channels ADD COLUMN IF NOT EXISTS expires_at timestamptz;
+CREATE INDEX IF NOT EXISTS channels_guest_expiry ON channels (expires_at) WHERE expires_at IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS posts (
   channel_id      bigint NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
@@ -294,6 +298,7 @@ CREATE TABLE IF NOT EXISTS media_assets (
 ALTER TABLE media_assets ADD COLUMN IF NOT EXISTS source_fingerprint text;
 
 CREATE INDEX IF NOT EXISTS posts_channel_date ON posts (channel_id, date DESC);
+CREATE INDEX IF NOT EXISTS posts_channel_date_id ON posts (channel_id, date DESC, message_id DESC);
 CREATE INDEX IF NOT EXISTS posts_date ON posts (date DESC);
 CREATE INDEX IF NOT EXISTS posts_tsv ON posts USING gin (tsv);
 CREATE INDEX IF NOT EXISTS posts_grouped ON posts (channel_id, grouped_id) WHERE grouped_id IS NOT NULL;

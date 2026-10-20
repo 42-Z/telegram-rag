@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { buildChunks, splitText } from "../src/chunks.ts";
 import { parseChannelRef } from "../src/telegram/client.ts";
-import { describeMedia, isPost, normalizeMessage, postLink, tidyMarkdown } from "../src/telegram/normalize.ts";
+import { describeMedia, isPost, normalizeMessage, postLink, SEARCH_EXCLUDED_MEDIA_TYPES, tidyMarkdown } from "../src/telegram/normalize.ts";
 import { collapseAlbums, fuseRankings } from "../src/tools.ts";
 import type { Post } from "../src/store.ts";
 
@@ -63,6 +63,182 @@ describe("normalizeMessage", () => {
         },
       }),
     ).toMatchObject({ type: "video", duration: 12, fileName: "clip.mp4" });
+  });
+
+  it("разбирает стикеры, документы и остальные типы вложений", () => {
+    const sticker = describeMedia({
+      className: "MessageMediaDocument",
+      document: {
+        id: { toString: () => "7" },
+        mimeType: "image/webp",
+        size: 123,
+        attributes: [
+          { className: "DocumentAttributeVideo", duration: 1 },
+          { className: "DocumentAttributeSticker", alt: "😺", stickerset: { shortName: "Cats" } },
+        ],
+      },
+    });
+    expect(sticker).toMatchObject({
+      type: "sticker",
+      mimeType: "image/webp",
+      size: 123,
+      sticker: { alt: "😺", setName: "Cats" },
+    });
+    expect(sticker?.searchText).toBeUndefined();
+
+    const document = describeMedia({
+      className: "MessageMediaDocument",
+      document: {
+        id: { toString: () => "8" },
+        mimeType: "application/pdf",
+        size: 2048,
+        attributes: [{ className: "DocumentAttributeFilename", fileName: "report.pdf" }],
+      },
+    });
+    expect(document).toMatchObject({
+      type: "document",
+      fileName: "report.pdf",
+      mimeType: "application/pdf",
+      searchText: "report.pdf",
+    });
+
+    // Анимация важнее видео-атрибута, даже если он идёт первым.
+    expect(
+      describeMedia({
+        className: "MessageMediaDocument",
+        document: {
+          attributes: [{ className: "DocumentAttributeVideo", duration: 2 }, { className: "DocumentAttributeAnimated" }],
+        },
+      })?.type,
+    ).toBe("gif");
+
+    expect(
+      describeMedia({
+        className: "MessageMediaContact",
+        phoneNumber: "+7 999 123-45-67",
+        firstName: "Иван",
+        lastName: "Петров",
+        userId: { toString: () => "42" },
+      }),
+    ).toMatchObject({
+      type: "contact",
+      contact: { phoneNumber: "+7 999 123-45-67", firstName: "Иван", lastName: "Петров", userId: "42" },
+      searchText: "Иван Петров +7 999 123-45-67",
+    });
+
+    expect(describeMedia({ className: "MessageMediaDice", value: 6, emoticon: "🎲" }))
+      .toMatchObject({ type: "dice", dice: { value: 6, emoticon: "🎲" } });
+
+    expect(
+      describeMedia({
+        className: "MessageMediaGame",
+        game: { id: { toString: () => "1" }, shortName: "chess", title: "Шахматы", description: "Игра" },
+      }),
+    ).toMatchObject({ type: "game", game: { id: "1", shortName: "chess", title: "Шахматы", description: "Игра" } });
+
+    expect(
+      describeMedia({
+        className: "MessageMediaInvoice",
+        title: "Подписка",
+        description: "Месяц доступа",
+        currency: "USD",
+        totalAmount: 500,
+      }),
+    ).toMatchObject({
+      type: "invoice",
+      invoice: { title: "Подписка", description: "Месяц доступа", currency: "USD", totalAmount: 500 },
+    });
+
+    expect(
+      describeMedia({
+        className: "MessageMediaStory",
+        peer: { channelId: { toString: () => "777" } },
+        id: 5,
+        story: { caption: "История", date: 100, expireDate: 200, media: { className: "MessageMediaPhoto" } },
+      }),
+    ).toMatchObject({
+      type: "story",
+      story: { id: 5, peer: { channelId: 777 }, caption: "История", mediaType: "photo" },
+    });
+
+    expect(
+      describeMedia({
+        className: "MessageMediaGiveaway",
+        quantity: 3,
+        months: 1,
+        stars: 100,
+        untilDate: 1000,
+        prizeDescription: "Подписка",
+        channels: [{ toString: () => "5" }],
+      }),
+    ).toMatchObject({
+      type: "giveaway",
+      giveaway: { quantity: 3, months: 1, stars: 100, untilDate: 1000, prizeDescription: "Подписка", channels: ["5"] },
+    });
+
+    expect(
+      describeMedia({
+        className: "MessageMediaGiveawayResults",
+        channelId: { toString: () => "5" },
+        launchMsgId: 10,
+        winnersCount: 2,
+        unclaimedCount: 1,
+        winners: [{ toString: () => "9" }],
+      }),
+    ).toMatchObject({
+      type: "giveaway_results",
+      giveawayResults: { channelId: "5", launchMessageId: 10, winnersCount: 2, winners: ["9"] },
+    });
+
+    expect(
+      describeMedia({
+        className: "MessageMediaPaidMedia",
+        starsAmount: 100,
+        extendedMedia: [{ className: "MessageExtendedMediaPreview", w: 640, h: 480, videoDuration: 5 }],
+      }),
+    ).toMatchObject({
+      type: "paid_media",
+      paidMedia: { starsAmount: 100, items: [{ preview: true, width: 640, height: 480, duration: 5 }] },
+    });
+
+    expect(
+      describeMedia({
+        className: "MessageMediaToDo",
+        todo: { title: { text: "Список" }, list: [{ id: 1, title: { text: "Пункт" } }] },
+        completions: [{}],
+      }),
+    ).toMatchObject({
+      type: "todo",
+      todo: { title: "Список", items: [{ id: 1, title: "Пункт" }], completions: 1 },
+    });
+
+    expect(
+      describeMedia({
+        className: "MessageMediaPoll",
+        poll: {
+          question: { text: "Кто?" },
+          answers: [{ text: { text: "Я" } }, { text: { text: "Ты" } }],
+          quiz: true,
+        },
+        results: { totalVoters: 10, results: [{ voters: 6, correct: true }, { voters: 4 }], solution: "Я" },
+      }),
+    ).toMatchObject({
+      type: "poll",
+      poll: { question: "Кто?", answers: ["Я", "Ты"], quiz: true, totalVoters: 10, solution: "Я" },
+    });
+
+    expect(
+      describeMedia({
+        className: "MessageMediaGeoLive",
+        geo: { lat: 1.5, long: 2.5 },
+        heading: 90,
+        period: 3600,
+      }),
+    ).toMatchObject({ type: "geo_live", geo: { lat: 1.5, long: 2.5, heading: 90, period: 3600 } });
+
+    expect(SEARCH_EXCLUDED_MEDIA_TYPES).toEqual(
+      expect.arrayContaining(["sticker", "custom_emoji", "giveaway", "giveaway_results", "paid_media"]),
+    );
   });
 
   it("склеивает соседние куски оформления", () => {

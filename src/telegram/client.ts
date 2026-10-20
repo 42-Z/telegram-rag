@@ -83,7 +83,7 @@ async function about(client: TelegramClient, peer: Api.InputPeerChannel): Promis
 export async function resolveChannel(
   client: TelegramClient,
   ref: string,
-  known?: { id: number; accessHash: string | null; username: string | null },
+  known?: { id: number; accessHash: string | null; username: string | null; about?: string | null },
 ): Promise<ResolvedChannel> {
   let entity: unknown;
   if (known?.username) {
@@ -108,5 +108,8 @@ export async function resolveChannel(
     }
   }
   const channel = fromEntity(entity);
-  return { ...channel, about: await about(client, channel.peer) };
+  return {
+    ...channel,
+    about: known && known.about !== undefined ? known.about : await about(client, channel.peer),
+  };
 }

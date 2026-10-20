@@ -13,8 +13,11 @@ export const SERVER_VERSION = "0.1.0-beta";
 
 const INSTRUCTIONS =
   "База знаний по постам Telegram-каналов. Начни с list_channels, чтобы увидеть пул. " +
-  "search_posts — поиск по смыслу и словам; list_posts — лента за период; get_post — пост целиком с альбомом " +
-  "и контекстом. Текст поста отдаётся вместе с прямыми временными ссылками на оригиналы медиа. " +
+  "search_posts — поиск по смыслу и словам по каналам пула; list_posts — короткая лента одного канала по @имени " +
+  "или ссылке, в том числе канала вне пула, с датами, offset и фильтром media_types для документов, стикеров и " +
+  "других вложений; get_post — пост целиком с альбомом, контекстом, просмотрами и реакциями. " +
+  "Каналы вне пула не участвуют в поиске, их вложения не архивируются, а кэш удаляется через время. " +
+  "Текст поста отдаётся вместе с прямыми временными ссылками на оригиналы медиа. " +
   "Отвечая, ссылайся на посты по полю link.";
 
 export function createMcpServer(context: ToolContext): McpServer {
@@ -26,7 +29,7 @@ export function createMcpServer(context: ToolContext): McpServer {
         title: tool.title,
         description: tool.description,
         inputSchema: tool.input.shape,
-        annotations: { readOnlyHint: tool.readOnly ?? true, openWorldHint: false },
+        annotations: { readOnlyHint: tool.readOnly ?? true, openWorldHint: tool.openWorld ?? false },
       },
       async (args: unknown) => {
         try {

@@ -17,6 +17,8 @@ export interface Channel {
   backfillDone: boolean;
   addedAt: Date;
   syncedAt: Date | null;
+  /** Канал вне пула: срок, после которого кэш удаляется. У каналов пула — null. */
+  expiresAt: Date | null;
 }
 
 export interface Post {
@@ -105,6 +107,16 @@ export interface PostFilter {
   channelIds?: number[];
   from?: Date;
   to?: Date;
+  /** Только посты старше этого номера сообщения (для перелистывания ленты). */
+  beforeMessageId?: number;
+  /** Только посты новее этого номера сообщения. */
+  afterMessageId?: number;
+  /** Только посты с вложениями этих типов. */
+  mediaTypes?: readonly string[];
+  /** Исключить посты с вложениями этих типов (например, стикеры из поиска). */
+  excludeMediaTypes?: readonly string[];
+  /** Читать и кэш каналов вне пула: поиск и обычная лента их не видят. */
+  includeGuest?: boolean;
 }
 
 export interface SearchHit {
@@ -123,7 +135,7 @@ export interface SearchHit {
 const channelColumns = (t = "") =>
   `${t}id, ${t}ref, ${t}username, ${t}title, ${t}about, ${t}access_hash AS "accessHash", ${t}enabled,
   ${t}last_message_id AS "lastMessageId", ${t}backfill_done AS "backfillDone", ${t}added_at AS "addedAt",
-  ${t}synced_at AS "syncedAt"`;
+  ${t}synced_at AS "syncedAt", ${t}expires_at AS "expiresAt"`;
 const CHANNEL_COLUMNS = channelColumns();
 
 const POST_COLUMNS = `p.channel_id AS "channelId", c.title AS channel, c.username AS "channelUsername",
@@ -148,7 +160,9 @@ const withLink = (row: PostRow): Post => ({
 
 /** Условия фильтра, начиная с параметра `$<offset+1>`. */
 function filterSql(filter: PostFilter, params: unknown[]): string {
-  const where = ["NOT p.deleted", "c.enabled"];
+  const where = ["NOT p.deleted"];
+  // Вне пула посты живут только в кэше и в поиске не участвуют.
+  if (!filter.includeGuest) where.push("c.enabled", "c.expires_at IS NULL");
   if (filter.channelIds && filter.channelIds.length > 0) {
     params.push(filter.channelIds);
     where.push(`p.channel_id = ANY($${params.length}::bigint[])`);
@@ -160,6 +174,22 @@ function filterSql(filter: PostFilter, params: unknown[]): string {
   if (filter.to) {
     params.push(filter.to);
     where.push(`p.date <= $${params.length}`);
+  }
+  if (filter.mediaTypes && filter.mediaTypes.length > 0) {
+    params.push(filter.mediaTypes);
+    where.push(`p.media->>'type' = ANY($${params.length}::text[])`);
+  }
+  if (filter.excludeMediaTypes && filter.excludeMediaTypes.length > 0) {
+    params.push(filter.excludeMediaTypes);
+    where.push(`(p.media IS NULL OR p.media->>'type' <> ALL($${params.length}::text[]))`);
+  }
+  if (filter.beforeMessageId !== undefined) {
+    params.push(filter.beforeMessageId);
+    where.push(`p.message_id < $${params.length}`);
+  }
+  if (filter.afterMessageId !== undefined) {
+    params.push(filter.afterMessageId);
+    where.push(`p.message_id > $${params.length}`);
   }
   return where.join(" AND ");
 }
@@ -190,16 +220,72 @@ export class Store {
          ref = EXCLUDED.ref, username = EXCLUDED.username, title = EXCLUDED.title,
          about = COALESCE(EXCLUDED.about, channels.about),
          access_hash = COALESCE(EXCLUDED.access_hash, channels.access_hash),
-         enabled = true
+         enabled = true, expires_at = NULL
        RETURNING ${CHANNEL_COLUMNS}`,
       [channel.id, channel.ref, channel.username, channel.title, channel.about, channel.accessHash],
     );
     return row!;
   }
 
-  async listChannels(options: { includeDisabled?: boolean } = {}): Promise<Channel[]> {
+  /**
+   * Канал вне пула: живёт в том же справочнике, но с датой удаления.
+   * Повторное чтение продлевает срок; канал пула гостем не становится.
+   */
+  async upsertGuestChannel(
+    channel: {
+      id: number;
+      ref: string;
+      username: string | null;
+      title: string;
+      about: string | null;
+      accessHash: string | null;
+    },
+    ttlSeconds: number,
+  ): Promise<Channel> {
+    const [row] = await this.db.query<Channel>(
+      `INSERT INTO channels (id, ref, username, title, about, access_hash, enabled, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, true, now() + $7::int * interval '1 second')
+       ON CONFLICT (id) DO UPDATE SET
+         ref = EXCLUDED.ref, username = EXCLUDED.username, title = EXCLUDED.title,
+         about = COALESCE(EXCLUDED.about, channels.about),
+         access_hash = COALESCE(EXCLUDED.access_hash, channels.access_hash),
+         expires_at = CASE
+           WHEN channels.expires_at IS NULL THEN NULL
+           ELSE now() + $7::int * interval '1 second'
+         END
+       RETURNING ${CHANNEL_COLUMNS}`,
+      [channel.id, channel.ref, channel.username, channel.title, channel.about, channel.accessHash, ttlSeconds],
+    );
+    return row!;
+  }
+
+  /** Удаляет гостевые каналы с истёкшим сроком вместе с их постами. */
+  async purgeExpiredGuestChannels(): Promise<number> {
+    const rows = await this.db.query<{ id: number }>(
+      "DELETE FROM channels WHERE expires_at IS NOT NULL AND expires_at <= now() RETURNING id",
+    );
+    return rows.length;
+  }
+
+  /** Оставляет не больше `max` гостевых каналов: давно не читанные удаляются первыми. */
+  async trimGuestChannels(max: number): Promise<number> {
+    const rows = await this.db.query<{ id: number }>(
+      `WITH excess AS (
+         SELECT id FROM channels WHERE expires_at IS NOT NULL
+         ORDER BY expires_at DESC OFFSET $1
+       )
+       DELETE FROM channels WHERE id IN (SELECT id FROM excess) RETURNING id`,
+      [max],
+    );
+    return rows.length;
+  }
+
+  async listChannels(options: { includeDisabled?: boolean; includeGuest?: boolean } = {}): Promise<Channel[]> {
+    const where = [];
+    if (!options.includeDisabled) where.push("enabled");
+    if (!options.includeGuest) where.push("expires_at IS NULL");
     return this.db.query<Channel>(
-      `SELECT ${CHANNEL_COLUMNS} FROM channels ${options.includeDisabled ? "" : "WHERE enabled"} ORDER BY added_at`,
+      `SELECT ${CHANNEL_COLUMNS} FROM channels ${where.length > 0 ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY added_at`,
     );
   }
 
@@ -220,7 +306,7 @@ export class Store {
          min(p.date) FILTER (WHERE NOT p.deleted) AS "firstPost",
          max(p.date) FILTER (WHERE NOT p.deleted) AS "lastPost"
        FROM channels c LEFT JOIN posts p ON p.channel_id = c.id
-       WHERE c.enabled
+       WHERE c.enabled AND c.expires_at IS NULL
        GROUP BY c.id ORDER BY c.added_at`,
       [mediaTypes],
     );
@@ -231,12 +317,14 @@ export class Store {
     const value = String(ref).trim();
     const username = value
       .replace(/^https?:\/\/(t|telegram)\.me\//i, "")
+      .replace(/^s\//, "")
       .replace(/^@/, "")
       .split(/[/?]/)[0]!;
     const id = /^-?\d+$/.test(value) ? Number(value.replace(/^-100/, "")) : null;
     const [row] = await this.db.query<Channel>(
       `SELECT ${CHANNEL_COLUMNS} FROM channels
-       WHERE id = $1 OR lower(username) = lower($2) OR ref = $3 LIMIT 1`,
+       WHERE id = $1 OR lower(username) = lower($2) OR ref = $3
+       ORDER BY (expires_at IS NULL) DESC, enabled DESC LIMIT 1`,
       [id ?? -1, username, value],
     );
     return row;
@@ -339,17 +427,43 @@ export class Store {
     return rows.map(withLink);
   }
 
-  /** Лента постов: по времени, с курсором по дате для перелистывания. */
+  /** Несколько постов канала по номерам сообщений — для кэша и альбомов. */
+  async getPosts(channelId: number, messageIds: readonly number[]): Promise<Post[]> {
+    if (messageIds.length === 0) return [];
+    const rows = await this.db.query<PostRow>(
+      `SELECT ${POST_COLUMNS} FROM posts p JOIN channels c ON c.id = p.channel_id
+       WHERE p.channel_id = $1 AND p.message_id = ANY($2::int[]) AND NOT p.deleted
+       ORDER BY p.message_id`,
+      [channelId, messageIds],
+    );
+    return rows.map(withLink);
+  }
+
+  /** Лента постов: по времени или по номерам сообщений, с перелистыванием. */
+  async countPosts(filter: PostFilter): Promise<number> {
+    const params: unknown[] = [];
+    const where = filterSql(filter, params);
+    const [row] = await this.db.query<{ total: number }>(
+      `SELECT count(*)::int AS total FROM posts p JOIN channels c ON c.id = p.channel_id WHERE ${where}`,
+      params,
+    );
+    return row?.total ?? 0;
+  }
+
   async listPosts(
-    filter: PostFilter & { order?: "newest" | "oldest"; limit: number; offset?: number },
+    filter: PostFilter & { order?: "newest" | "oldest"; limit: number; offset?: number; count?: boolean },
   ): Promise<{ posts: Post[]; total: number }> {
     const params: unknown[] = [];
     const where = filterSql(filter, params);
     const direction = filter.order === "oldest" ? "ASC" : "DESC";
-    const [count] = await this.db.query<{ total: number }>(
-      `SELECT count(*)::int AS total FROM posts p JOIN channels c ON c.id = p.channel_id WHERE ${where}`,
-      params,
-    );
+    let total = 0;
+    if (filter.count !== false) {
+      const [count] = await this.db.query<{ total: number }>(
+        `SELECT count(*)::int AS total FROM posts p JOIN channels c ON c.id = p.channel_id WHERE ${where}`,
+        params,
+      );
+      total = count?.total ?? 0;
+    }
     params.push(filter.limit, filter.offset ?? 0);
     const rows = await this.db.query<PostRow>(
       `SELECT ${POST_COLUMNS} FROM posts p JOIN channels c ON c.id = p.channel_id
@@ -358,7 +472,7 @@ export class Store {
        LIMIT $${params.length - 1} OFFSET $${params.length}`,
       params,
     );
-    return { posts: rows.map(withLink), total: count?.total ?? 0 };
+    return { posts: rows.map(withLink), total };
   }
 
   // ── индексация ──────────────────────────────────────────────────────────
@@ -372,7 +486,7 @@ export class Store {
          p.index_hash AS "indexHash", c.title AS "channelTitle"
        FROM posts p JOIN channels c ON c.id = p.channel_id
        LEFT JOIN media_assets a ON a.channel_id = p.channel_id AND a.message_id = p.message_id
-       WHERE NOT p.deleted AND p.embed_error IS NULL AND (
+       WHERE NOT p.deleted AND c.expires_at IS NULL AND p.embed_error IS NULL AND (
          p.embedded_hash IS DISTINCT FROM p.index_hash
          OR (p.media->>'type' = ANY($2::text[]) AND (
            a.asset_id IS NULL OR a.storage_status = 'pending'
@@ -716,6 +830,7 @@ export class Store {
         `SELECT coalesce(a.storage_status, 'pending') AS status, count(*)::int AS count
          FROM posts p LEFT JOIN media_assets a ON a.channel_id = p.channel_id AND a.message_id = p.message_id
          WHERE p.media IS NOT NULL AND NOT p.deleted AND p.media->>'type' = ANY($1::text[])
+           AND NOT EXISTS (SELECT 1 FROM channels c WHERE c.id = p.channel_id AND c.expires_at IS NOT NULL)
          GROUP BY 1`,
         [types],
       ),
@@ -723,6 +838,7 @@ export class Store {
         `SELECT coalesce(a.embedding_status, 'pending') AS status, count(*)::int AS count
          FROM posts p LEFT JOIN media_assets a ON a.channel_id = p.channel_id AND a.message_id = p.message_id
          WHERE p.media IS NOT NULL AND NOT p.deleted AND p.media->>'type' = ANY($1::text[])
+           AND NOT EXISTS (SELECT 1 FROM channels c WHERE c.id = p.channel_id AND c.expires_at IS NOT NULL)
          GROUP BY 1`,
         [types],
       ),
@@ -766,7 +882,8 @@ export class Store {
            ))
          )::int AS failed,
          (SELECT count(*)::int FROM chunks) AS chunks
-        FROM posts`,
+        FROM posts
+        WHERE NOT EXISTS (SELECT 1 FROM channels c WHERE c.id = posts.channel_id AND c.expires_at IS NOT NULL)`,
       [mediaTypes],
     );
     return row!;

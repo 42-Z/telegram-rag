@@ -1,7 +1,17 @@
 import type { ObjectStorage } from "./storage.ts";
 import type { MediaAsset, Post, Store } from "./store.ts";
 
-const DOWNLOADABLE_TYPES = new Set(["photo", "voice", "video_note", "audio", "video", "gif"]);
+const DOWNLOADABLE_TYPES = new Set([
+  "photo",
+  "voice",
+  "video_note",
+  "audio",
+  "video",
+  "gif",
+  "sticker",
+  "document",
+  "custom_emoji",
+]);
 
 export interface MediaLinkResource {
   type: "resource_link";
@@ -91,12 +101,34 @@ async function presentMedia(
   return clean(view);
 }
 
+/** Метаданные вложения без архива: каналы вне пула не сохраняют файлы. */
+export function presentExternalMedia(post: Post): MediaPresentation | undefined {
+  const media = post.media;
+  if (!media) return undefined;
+  const view = sourceMedia(media);
+  if (DOWNLOADABLE_TYPES.has(media.type)) {
+    Object.assign(view, {
+      file_name: displayFileName(media.fileName),
+      mime_type: media.mimeType,
+      size: media.size,
+      duration: media.duration,
+      archived: false,
+      download_error: "канал вне пула: вложения не сохраняются, откройте пост в Telegram",
+    });
+  }
+  return clean(view);
+}
+
 /** Prepare asset metadata in one batch and sign each distinct object at most once. */
 export async function presentPostMedia(
   posts: readonly Post[],
   store: Pick<Store, "getMediaAssetsForPosts">,
   storage?: ObjectStorage,
+  options: { archived?: boolean } = {},
 ): Promise<Map<string, MediaPresentation | undefined>> {
+  if (options.archived === false) {
+    return new Map(posts.map((post) => [postKey(post), presentExternalMedia(post)]));
+  }
   const assets = await store.getMediaAssetsForPosts(posts);
   const byPost = new Map(assets.map((asset) => [postKey(asset), asset]));
   const signed = new Map<string, Promise<{ url: string; expiresAt: Date }>>();
