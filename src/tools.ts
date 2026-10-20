@@ -14,7 +14,7 @@ import { logger } from "./log.ts";
 import { postKey, presentPost, presentPostMedia } from "./presentation.ts";
 import type { ObjectStorage } from "./storage.ts";
 import type { Post, PostFilter, SearchHit, Store } from "./store.ts";
-import { SEARCH_EXCLUDED_MEDIA_TYPES } from "./telegram/normalize.ts";
+import { SEARCH_EXCLUDED_MEDIA_TYPES, type PostMedia } from "./telegram/normalize.ts";
 import type { GuestReader } from "./telegram/reader.ts";
 
 const log = logger("tools");
@@ -133,6 +133,9 @@ async function buildFilter(
 }
 
 const iso = (date: Date | string | null | undefined) => (date ? new Date(date).toISOString() : undefined);
+/** Дата без миллисекунд — для ленты постов. */
+const isoSeconds = (date: Date | string | null | undefined) =>
+  date ? new Date(date).toISOString().replace(/\.\d{3}Z$/, "Z") : undefined;
 
 /**
  * Альбом в Telegram — несколько сообщений с общим grouped_id, подпись
@@ -160,20 +163,193 @@ export function collapseAlbums(posts: readonly Post[]): Array<Post & { album?: P
   return result;
 }
 
-function presentAlbumAware(post: Post & { album?: Post[] }, media: Map<string, Record<string, unknown> | undefined>) {
-  if (!post.album || post.album.length < 2) return presentPost(post, media.get(postKey(post)));
-  const items = [...post.album].sort((a, b) => a.messageId - b.messageId);
-  return presentPost(post, media.get(postKey(post)), {
-    album: items.map((item) => presentPost(item, media.get(postKey(item)))),
-  });
+/** Короткое представление вложения: только смысл и тип, без ссылок и служебных полей. */
+function compactMedia(media: PostMedia): Record<string, unknown> {
+  const view: Record<string, unknown> = { type: media.type };
+
+  switch (media.type) {
+    case "voice":
+    case "audio":
+    case "video":
+    case "video_note":
+    case "gif":
+      if (media.duration !== undefined) view.duration = media.duration;
+      if (media.audio?.title || media.audio?.performer) {
+        view.audio = {
+          ...(media.audio.title ? { title: media.audio.title } : {}),
+          ...(media.audio.performer ? { performer: media.audio.performer } : {}),
+        };
+      }
+      break;
+    case "document":
+      if (media.mimeType) view.mime_type = media.mimeType;
+      if (media.size !== undefined) view.size = media.size;
+      break;
+    case "sticker":
+    case "custom_emoji":
+      if (media.sticker?.alt || media.sticker?.setName) {
+        view.sticker = {
+          ...(media.sticker.alt ? { alt: media.sticker.alt } : {}),
+          ...(media.sticker.setName ? { setName: media.sticker.setName } : {}),
+        };
+      }
+      break;
+    case "webpage":
+      if (media.webpage) {
+        view.webpage = {
+          ...(media.webpage.url ? { url: media.webpage.url } : {}),
+          ...(media.webpage.title ? { title: media.webpage.title } : {}),
+          ...(media.webpage.description ? { description: media.webpage.description } : {}),
+          ...(media.webpage.siteName ? { siteName: media.webpage.siteName } : {}),
+        };
+      }
+      break;
+    case "poll":
+      if (media.poll) {
+        view.poll = {
+          question: media.poll.question,
+          answers: media.poll.answers,
+          ...(media.poll.quiz ? { quiz: true } : {}),
+          ...(media.poll.closed ? { closed: true } : {}),
+        };
+      }
+      break;
+    case "geo":
+    case "venue":
+    case "geo_live":
+      if (media.geo) {
+        view.geo = {
+          ...(media.geo.lat !== undefined ? { lat: media.geo.lat } : {}),
+          ...(media.geo.long !== undefined ? { long: media.geo.long } : {}),
+          ...(media.geo.title ? { title: media.geo.title } : {}),
+          ...(media.geo.address ? { address: media.geo.address } : {}),
+        };
+      }
+      break;
+    case "contact":
+      if (media.contact) {
+        view.contact = {
+          ...(media.contact.firstName ? { firstName: media.contact.firstName } : {}),
+          ...(media.contact.lastName ? { lastName: media.contact.lastName } : {}),
+          ...(media.contact.phoneNumber ? { phoneNumber: media.contact.phoneNumber } : {}),
+        };
+      }
+      break;
+    case "dice":
+      if (media.dice) {
+        view.dice = {
+          ...(media.dice.value !== undefined ? { value: media.dice.value } : {}),
+          ...(media.dice.emoticon ? { emoticon: media.dice.emoticon } : {}),
+        };
+      }
+      break;
+    case "game":
+      if (media.game) {
+        view.game = {
+          ...(media.game.title ? { title: media.game.title } : {}),
+          ...(media.game.description ? { description: media.game.description } : {}),
+        };
+      }
+      break;
+    case "invoice":
+      if (media.invoice) {
+        view.invoice = {
+          ...(media.invoice.title ? { title: media.invoice.title } : {}),
+          ...(media.invoice.description ? { description: media.invoice.description } : {}),
+          ...(media.invoice.currency ? { currency: media.invoice.currency } : {}),
+          ...(media.invoice.totalAmount !== undefined ? { totalAmount: media.invoice.totalAmount } : {}),
+        };
+      }
+      break;
+    case "story":
+      if (media.story) {
+        view.story = {
+          ...(media.story.id !== undefined ? { id: media.story.id } : {}),
+          ...(media.story.caption ? { caption: media.story.caption } : {}),
+          ...(media.story.mediaType ? { mediaType: media.story.mediaType } : {}),
+        };
+      }
+      break;
+    case "giveaway":
+      if (media.giveaway) {
+        view.giveaway = {
+          ...(media.giveaway.quantity !== undefined ? { quantity: media.giveaway.quantity } : {}),
+          ...(media.giveaway.months !== undefined ? { months: media.giveaway.months } : {}),
+          ...(media.giveaway.stars !== undefined ? { stars: media.giveaway.stars } : {}),
+          ...(media.giveaway.prizeDescription ? { prizeDescription: media.giveaway.prizeDescription } : {}),
+          ...(media.giveaway.channels && media.giveaway.channels.length > 0 ? { channels: media.giveaway.channels } : {}),
+          ...(media.giveaway.untilDate !== undefined ? { untilDate: media.giveaway.untilDate } : {}),
+        };
+      }
+      break;
+    case "giveaway_results":
+      if (media.giveawayResults) {
+        view.giveawayResults = {
+          ...(media.giveawayResults.winnersCount !== undefined ? { winnersCount: media.giveawayResults.winnersCount } : {}),
+          ...(media.giveawayResults.unclaimedCount !== undefined ? { unclaimedCount: media.giveawayResults.unclaimedCount } : {}),
+          ...(media.giveawayResults.prizeDescription ? { prizeDescription: media.giveawayResults.prizeDescription } : {}),
+          ...(media.giveawayResults.winners && media.giveawayResults.winners.length > 0 ? { winners: media.giveawayResults.winners } : {}),
+        };
+      }
+      break;
+    case "paid_media": {
+      const items = media.paidMedia?.items ?? [];
+      view.paidMedia = {
+        ...(media.paidMedia?.starsAmount !== undefined ? { starsAmount: media.paidMedia.starsAmount } : {}),
+        ...(items.length > 0
+          ? {
+              items: items.map((item) => ({
+                ...(item.preview ? { preview: true } : {}),
+                ...(typeof item.type === "string" ? { type: item.type } : {}),
+                ...(typeof item.duration === "number" ? { duration: item.duration } : {}),
+              })),
+            }
+          : {}),
+      };
+      break;
+    }
+    case "todo":
+      if (media.todo) {
+        view.todo = {
+          ...(media.todo.title ? { title: media.todo.title } : {}),
+          ...(media.todo.items && media.todo.items.length > 0
+            ? { items: media.todo.items.map((item) => item.title) }
+            : {}),
+        };
+      }
+      break;
+    default:
+      break;
+  }
+
+  return view;
 }
 
-/** Лента постов с альбомами и вложениями — общая для пула и каналов вне пула. */
+/** Короткий пост для ленты: без просмотров, реакций и служебных полей медиа. */
+function compactPost(post: Post): Record<string, unknown> {
+  const view: Record<string, unknown> = {
+    message_id: post.messageId,
+    link: post.link,
+    date: isoSeconds(post.date),
+  };
+  if (post.text) view.text = post.text;
+  if (post.postAuthor) view.author = post.postAuthor;
+  if (post.editDate) view.edited = isoSeconds(post.editDate);
+  if (post.media) view.media = compactMedia(post.media);
+  return view;
+}
+
+function compactAlbumAware(post: Post & { album?: Post[] }): Record<string, unknown> {
+  const view = compactPost(post);
+  if (!post.album || post.album.length < 2) return view;
+  const items = [...post.album].sort((a, b) => a.messageId - b.messageId);
+  return { ...view, album: items.map((item) => compactPost(item)) };
+}
+
+/** Лента постов с альбомами — без запросов к S3: ссылки на оригиналы отдаёт get_post. */
 async function presentFeed(
   posts: readonly Post[],
-  store: Pick<Store, "getAlbum" | "getMediaAssetsForPosts">,
-  storage: ObjectStorage | undefined,
-  options: { archived?: boolean } = {},
+  store: Pick<Store, "getAlbum">,
 ) {
   const albums = new Map<string, Post[]>();
   for (const post of posts) {
@@ -186,24 +362,11 @@ async function presentFeed(
   const unique = [...new Map(expanded.map((post) => [postKey(post), post])).values()];
   const collapsed = collapseAlbums(unique);
   const allPosts = collapsed.flatMap((post) => post.album ?? [post]);
-  const media = await presentPostMedia(allPosts, store, storage, { archived: options.archived });
   return {
-    posts: collapsed.map((post) => presentAlbumAware(post, media)),
+    posts: collapsed.map((post) => compactAlbumAware(post)),
     minMessageId: allPosts.length > 0 ? Math.min(...allPosts.map((post) => post.messageId)) : undefined,
     maxMessageId: allPosts.length > 0 ? Math.max(...allPosts.map((post) => post.messageId)) : undefined,
   };
-}
-
-/** В ленте одного канала название и id канала в каждом посте — лишний повтор. */
-function withoutChannel(posts: ReadonlyArray<Record<string, unknown>>): Array<Record<string, unknown>> {
-  const strip = (post: Record<string, unknown>): Record<string, unknown> => {
-    const { channel: _channel, channel_username: _username, channel_id: _channelId, ...rest } = post;
-    if (Array.isArray(rest.album)) {
-      rest.album = rest.album.map((item) => strip(item as Record<string, unknown>));
-    }
-    return rest;
-  };
-  return posts.map(strip);
 }
 
 /** Сколько сообщений просматривать в поисках нужного типа, чтобы не зависнуть. */
@@ -519,8 +682,9 @@ export const TOOLS: ToolDef[] = [
     name: "list_posts",
     title: "Посты канала",
     description:
-      "Посты одного канала по @имени, ссылке t.me/<имя> или id — от новых к старым. Работает и для каналов вне " +
-      "пула: они читаются из Telegram, живут во временном кэше, не участвуют в поиске, вложения не архивируются. " +
+      "Короткая лента одного канала по @имени, ссылке t.me/<имя> или id — от новых к старым. Работает и для " +
+      "каналов вне пула. Отдаёт message_id, link, date, text, media и album без просмотров, реакций, комментариев " +
+      "и служебных полей вложений; подробности и скачивание — через get_post. " +
       "Перелистывание вглубь — before_message_id, добрать новее — after_message_id. " +
       "media_types оставляет только посты с документами, стикерами или другими указанными вложениями.",
     readOnly: false,
@@ -541,7 +705,7 @@ export const TOOLS: ToolDef[] = [
         .describe("Только посты новее этого номера — чтобы добрать новые"),
       media_types: mediaTypesArg,
     }),
-    async run(args, { store, storage, guests }) {
+    async run(args, { store, guests }) {
       const limit = args.limit ?? 20;
       const mediaTypes = normalizeMediaTypes(args.media_types);
       const channel = await store.findChannel(args.channel);
@@ -551,7 +715,6 @@ export const TOOLS: ToolDef[] = [
       }
 
       let result: { posts: Post[]; nextBeforeMessageId?: number; nextAfterMessageId?: number };
-      let archived = true;
       if (channel && !channel.expiresAt) {
         result = await collectChannelPosts(store, channel.id, {
           limit,
@@ -576,12 +739,11 @@ export const TOOLS: ToolDef[] = [
           nextBeforeMessageId: page.nextBeforeMessageId,
           nextAfterMessageId: page.nextAfterMessageId,
         };
-        archived = false;
       }
 
-      const feed = await presentFeed(result.posts, store, storage, { archived });
+      const feed = await presentFeed(result.posts, store);
       return {
-        posts: withoutChannel(feed.posts),
+        posts: feed.posts,
         next_before_message_id: feed.minMessageId ?? result.nextBeforeMessageId,
         next_after_message_id: args.after_message_id !== undefined
           ? feed.maxMessageId ?? result.nextAfterMessageId

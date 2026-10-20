@@ -214,9 +214,10 @@ describe("каналы вне пула", () => {
     expect(response.body.source).toBeUndefined();
     const album = response.body.posts[1];
     expect(album.album).toHaveLength(2);
-    expect(album.media).toMatchObject({ type: "photo", archived: false });
-    expect(album.media.download_error).toContain("не сохраняются");
+    expect(album.media).toMatchObject({ type: "photo" });
     expect(album.media.url).toBeUndefined();
+    expect(album.media.archived).toBeUndefined();
+    expect(album.media.download_error).toBeUndefined();
   });
 
   it("не вступает в закрытые каналы и понятно отказывает", async () => {

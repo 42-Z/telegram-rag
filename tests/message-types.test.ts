@@ -164,19 +164,23 @@ describe("типы сообщений", () => {
     const byId = new Map<number, any>(list.posts.map((post: any) => [post.message_id, post]));
 
     expect(byId.get(1).channel).toBeUndefined();
+    expect(byId.get(1).views).toBeUndefined();
+    expect(list.posts[0].date).not.toContain(".");
     expect(byId.get(1).media).toMatchObject({
       type: "sticker",
       sticker: { alt: "😺", setName: "Cats" },
-      storage_status: "stored",
-      url: expect.stringMatching(/^https:\/\/objects\.example\.test\//),
     });
+    expect(byId.get(1).media).not.toHaveProperty("file_name");
+    expect(byId.get(1).media).not.toHaveProperty("storage_status");
+    expect(byId.get(1).media).not.toHaveProperty("url");
     expect(byId.get(2).media).toMatchObject({
       type: "document",
-      file_name: "report.pdf",
       mime_type: "application/pdf",
-      storage_status: "stored",
-      url: expect.stringMatching(/^https:\/\/objects\.example\.test\//),
+      size: 12,
     });
+    expect(byId.get(2).media).not.toHaveProperty("file_name");
+    expect(byId.get(2).media).not.toHaveProperty("storage_status");
+    expect(byId.get(2).media).not.toHaveProperty("url");
     expect(byId.get(3).media).toMatchObject({
       type: "giveaway",
       giveaway: { quantity: 3, prizeDescription: "Подписка", channels: ["5"] },
@@ -187,7 +191,7 @@ describe("типы сообщений", () => {
     });
     expect(byId.get(6).media).toMatchObject({
       type: "paid_media",
-      paidMedia: { starsAmount: 50, items: [{ preview: true, width: 640, height: 480, duration: 5 }] },
+      paidMedia: { starsAmount: 50, items: [{ preview: true, duration: 5 }] },
     });
   });
 
