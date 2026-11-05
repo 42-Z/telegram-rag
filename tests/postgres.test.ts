@@ -94,7 +94,7 @@ describe("сервис через драйвер pg", async () => {
 
     const context = { store, embedder };
     const found = (await callTool("search_posts", { query: "рецепт борща", limit: 1 }, context)) as any;
-    expect(found.results[0]).toMatchObject({ channel: "Кулинария", message_id: 1 });
+    expect(found.results[0]).toMatchObject({ link: "https://t.me/food/1", message_id: 1 });
 
     const post = (await callTool("get_post", { link: "https://t.me/tech/3" }, context)) as any;
     expect(post.album).toHaveLength(2);

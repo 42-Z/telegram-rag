@@ -7,7 +7,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { migrate } from "../src/db.ts";
 import { createApp } from "../src/http.ts";
 import { Indexer } from "../src/indexer.ts";
@@ -57,6 +57,15 @@ const tool = async (name: string, args: unknown) => {
 
 beforeAll(async () => {
   await seed(store);
+  await store.upsertPosts([normalizeMessage(1001, message(4, "Фото с презентации процессоров", {
+    media: { className: "MessageMediaPhoto" },
+    groupedId: { toString: () => "77" },
+    postAuthor: "Редакция",
+    editDate: Date.UTC(2026, 8, 1, 17) / 1000,
+    forwards: 7,
+    replies: { replies: 2 },
+    reactions: { results: [{ reaction: { className: "ReactionEmoji", emoticon: "👍" }, count: 5 }] },
+  }))]);
   while ((await indexer.runOnce()) > 0);
   const bytes = Buffer.from("photo-original");
   const sha256 = createHash("sha256").update(bytes).digest("hex");
@@ -120,7 +129,7 @@ describe("REST", () => {
   it("search_posts находит по смыслу и по словам", async () => {
     const { body } = await tool("search_posts", { query: "рецепт борща со свёклой" });
     expect(body.mode).toBe("hybrid");
-    expect(body.results[0]).toMatchObject({ channel: "Кулинария", message_id: 1, link: "https://t.me/food/1" });
+    expect(body.results[0]).toMatchObject({ message_id: 1, link: "https://t.me/food/1" });
 
     const keyword = await tool("search_posts", { query: "смартфона", mode: "keyword" });
     expect(keyword.body.results[0].text).toContain("смартфона");
@@ -130,9 +139,72 @@ describe("REST", () => {
     expect(morph.body.results[0]?.message_id).toBe(1);
   });
 
+  it.each(["hybrid", "keyword", "semantic"])("search_posts в режиме %s отдаёт компактный альбом как list_posts без подписи ссылок", async (mode) => {
+    const feed = await tool("list_posts", { channel: "@tech", limit: 100 });
+    const before = signedCount;
+    const { status, body } = await tool("search_posts", {
+      query: "Фото с презентации процессоров", channels: ["@tech"], mode, limit: 1,
+    });
+    expect(status).toBe(200);
+    expect(body.mode).toBe(mode);
+    expect(body.results).toHaveLength(1);
+    const { score, match, ...post } = body.results[0];
+    expect(score).toEqual(expect.any(Number));
+    expect(match).toBeUndefined();
+    expect(post).toEqual(feed.body.posts[0]);
+    expect(post).toEqual({
+      message_id: 4,
+      link: "https://t.me/tech/4",
+      date: "2026-09-01T16:00:00Z",
+      text: "Фото с презентации процессоров",
+      author: "Редакция",
+      edited: "2026-09-01T17:00:00Z",
+      media: { type: "photo" },
+      album: [
+        { message_id: 3, link: "https://t.me/tech/3", date: "2026-09-01T15:00:00Z", media: { type: "photo" } },
+        {
+          message_id: 4, link: "https://t.me/tech/4", date: "2026-09-01T16:00:00Z",
+          text: "Фото с презентации процессоров", author: "Редакция", edited: "2026-09-01T17:00:00Z", media: { type: "photo" },
+        },
+      ],
+    });
+    expect(signedCount).toBe(before);
+  });
+
+  it.each(["semantic", "hybrid"])("search_posts в режиме %s сохраняет отдельные совпадения альбома, оценки и нулевой таймкод", async (mode) => {
+    const caption = (await store.getPost(1001, 4))!;
+    const photo = (await store.getPost(1001, 3))!;
+    const semantic = vi.spyOn(store, "semanticSearch").mockResolvedValue([
+      { post: caption, score: 0.87654, match: { kind: "video", mediaAssetId: null, startSeconds: 0, endSeconds: 12.5 } },
+      { post: photo, score: 0.65432, match: { kind: "image", mediaAssetId: null, startSeconds: null, endSeconds: null } },
+    ]);
+    try {
+      const feed = await tool("list_posts", { channel: "@tech", limit: 1 });
+      const before = signedCount;
+      const { body } = await tool("search_posts", {
+        query: caption.text, channels: ["@tech"], mode, limit: 2,
+      });
+      expect(body.results.map((hit: any) => hit.message_id)).toEqual([4, 3]);
+      expect(body.results.map((hit: any) => hit.score)).toEqual(mode === "semantic" ? [0.8765, 0.6543] : [0.0328, 0.0161]);
+      expect(body.results.map((hit: any) => hit.match)).toEqual([
+        { kind: "video", message_id: 4, start_seconds: 0, end_seconds: 12.5 },
+        { kind: "image", message_id: 3 },
+      ]);
+      const compact = body.results.map(({ score, match, ...post }: any) => post);
+      expect(compact).toEqual([
+        feed.body.posts[0],
+        { ...feed.body.posts[0].album[0], album: feed.body.posts[0].album },
+      ]);
+      expect(signedCount).toBe(before);
+    } finally {
+      semantic.mockRestore();
+    }
+  });
+
   it("фильтр по каналу и датам", async () => {
     const { body } = await tool("search_posts", { query: "хлеб", channels: ["@tech"] });
-    expect(body.results.every((r: any) => r.channel === "Tech News")).toBe(true);
+    expect(body.results.length).toBeGreaterThan(0);
+    expect(body.results.every((r: any) => r.link.startsWith("https://t.me/tech/"))).toBe(true);
 
     const none = await tool("search_posts", { query: "хлеб", date_to: "2020-01-01" });
     expect(none.body.results).toHaveLength(0);
@@ -190,6 +262,10 @@ describe("REST", () => {
     });
     expect(body.media.url).toMatch(/^https:\/\/objects\.example\.test\//);
     expect(body.album[1].media.url).toBeUndefined();
+    expect(body.album[1]).toMatchObject({
+      channel: "Tech News", channel_id: 1001, channel_username: "tech",
+      views: 104, forwards: 7, comments: 2, reactions: [{ reaction: "👍", count: 5 }],
+    });
 
     const again = await tool("get_post", { link: "https://t.me/tech/3" });
     expect(again.body.media.url).not.toBe(body.media.url);
@@ -271,17 +347,42 @@ describe("подключение любых моделей", () => {
     expect(payload.results[0].link).toBe("https://t.me/food/2");
     expect(result.structuredContent.results[0].message_id).toBe(2);
 
+    const channel = (await client.callTool({ name: "list_posts", arguments: { channel: "@tech", limit: 3 } })) as any;
+    const channelPayload = JSON.parse(channel.content[0].text);
+    expect(channelPayload.posts.map((post: any) => post.message_id)).toEqual([4, 2, 1]);
+    expect(channelPayload.posts[0].channel).toBeUndefined();
+
+    const caption = (await store.getPost(1001, 4))!;
+    const semantic = vi.spyOn(store, "semanticSearch").mockResolvedValue([
+      { post: caption, score: 0.87654, match: { kind: "video", mediaAssetId: null, startSeconds: 0, endSeconds: 12.5 } },
+    ]);
+    try {
+      const before = signedCount;
+      const search = (await client.callTool({
+        name: "search_posts", arguments: { query: caption.text, mode: "semantic", limit: 1 },
+      })) as any;
+      const searchPayload = JSON.parse(search.content[0].text);
+      expect(search.structuredContent).toEqual(searchPayload);
+      expect(search.content.map((block: any) => block.type)).toEqual(["text"]);
+      expect(searchPayload.results).toHaveLength(1);
+      const { score, match, ...post } = searchPayload.results[0];
+      expect(post).toEqual(channelPayload.posts[0]);
+      expect(score).toBe(0.8765);
+      expect(match).toEqual({ kind: "video", message_id: 4, start_seconds: 0, end_seconds: 12.5 });
+      expect(signedCount).toBe(before);
+    } finally {
+      semantic.mockRestore();
+    }
+
     const media = (await client.callTool({ name: "get_post", arguments: { link: "https://t.me/tech/3" } })) as any;
     const mediaPayload = JSON.parse(media.content[0].text);
     const resource = media.content.find((block: any) => block.type === "resource_link");
     expect(resource.uri).toBe(mediaPayload.media.url);
     expect(resource.uri).toMatch(/^https:\/\/objects\.example\.test\//);
     expect(media.structuredContent.media.url).toBe(resource.uri);
-
-    const channel = (await client.callTool({ name: "list_posts", arguments: { channel: "@tech", limit: 3 } })) as any;
-    const channelPayload = JSON.parse(channel.content[0].text);
-    expect(channelPayload.posts.map((post: any) => post.message_id)).toEqual([4, 2, 1]);
-    expect(channelPayload.posts[0].channel).toBeUndefined();
+    expect(mediaPayload.album[1]).toMatchObject({
+      views: 104, forwards: 7, comments: 2, reactions: [{ reaction: "👍", count: 5 }],
+    });
 
     const error = (await client.callTool({ name: "get_post", arguments: { link: "мусор" } })) as any;
     expect(error.isError).toBe(true);
@@ -290,16 +391,18 @@ describe("подключение любых моделей", () => {
 });
 
 describe("сбой сервиса эмбеддингов", () => {
-  it("поиск откатывается на слова и говорит об этом", async () => {
+  it.each(["hybrid", "semantic"])("поиск %s откатывается на слова и говорит об этом", async (mode) => {
     const failing = { ...embedder, embed: async () => { throw new Error("503 embedding unavailable"); } };
     const degraded = createApp({ context: { store, embedder: failing, storage } });
     const response = await degraded.request("/api/tools/search_posts", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ query: "борщ" }),
+      body: JSON.stringify({ query: "борщ", mode }),
     });
     const body = (await response.json()) as any;
     expect(body.mode).toBe("keyword");
-    expect(body.notice).toBeTruthy();
+    expect(body.notice).toBe("поиск по смыслу временно недоступен — результат только по словам");
+    const keyword = await tool("search_posts", { query: "борщ", mode: "keyword" });
+    expect(body.results).toEqual(keyword.body.results);
   });
 });

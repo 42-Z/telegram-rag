@@ -550,8 +550,9 @@ export const TOOLS: ToolDef[] = [
     name: "search_posts",
     title: "Поиск по постам",
     description:
-      "Поиск по исходному тексту, изображениям, аудио и видео через прямые эмбеддинги. Возвращает текст поста, " +
-      "метаданные вложений, прямые временные ссылки на сохранённые оригиналы и ссылки на Telegram-посты. " +
+      "Поиск по исходному тексту, изображениям, аудио и видео через прямые эмбеддинги. Возвращает компактные " +
+      "посты как list_posts, с оценкой score и метаданными медиа-совпадения match. " +
+      "Статистика, реакции, технические поля вложений и ссылки на оригиналы доступны только через get_post. " +
       "Формулируй запрос обычными словами — синонимы и перефразы находятся. Для точных " +
       "имён, чисел и терминов можно mode=keyword, для абстрактных тем — mode=semantic.",
     input: z.object({
@@ -565,7 +566,7 @@ export const TOOLS: ToolDef[] = [
         .optional()
         .describe("hybrid (по умолчанию) — смысл + слова; semantic — только смысл; keyword — только слова"),
     }),
-    async run(args, { store, embedder, storage }) {
+    async run(args, { store, embedder }) {
       const limit = args.limit ?? 10;
       const filter = await buildFilter(store, args);
       // Стикеры, раздачи и платные медиа видны в ленте, но не в поиске.
@@ -593,8 +594,6 @@ export const TOOLS: ToolDef[] = [
         const key = post.groupedId ? `${post.channelId}:${post.groupedId}` : undefined;
         if (key && !albums.has(key)) albums.set(key, await store.getAlbum(post.channelId, post.groupedId!));
       }
-      const related = [...hits.map((hit) => hit.post), ...[...albums.values()].flat()];
-      const media = await presentPostMedia(related, store, storage);
       return {
         query: args.query,
         mode,
@@ -611,13 +610,11 @@ export const TOOLS: ToolDef[] = [
           const album = hit.post.groupedId
             ? albums.get(`${hit.post.channelId}:${hit.post.groupedId}`)
             : undefined;
-          return presentPost(hit.post, media.get(postKey(hit.post)), {
+          return {
+            ...compactAlbumAware({ ...hit.post, album }),
             score: Number(hit.score.toFixed(4)),
             match,
-            ...(album && album.length > 1
-              ? { album: album.map((item) => presentPost(item, media.get(postKey(item)))) }
-              : {}),
-          });
+          };
         }),
       };
     },
