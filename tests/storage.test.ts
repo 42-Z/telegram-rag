@@ -464,7 +464,7 @@ describe("S3-compatible object storage", () => {
   it("rejects signing when expiresBy has already elapsed", async () => {
     const storage = makeStorage();
     await expect(storage.signGet(testKey(Buffer.from("expired")), new Date(Date.now() - 1000)))
-      .rejects.toThrow();
+      .rejects.toThrow("Original retention expires too soon to sign a GET URL");
     expect(requests).toHaveLength(0);
   });
 

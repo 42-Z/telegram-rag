@@ -195,6 +195,7 @@ class S3ObjectStorage implements ObjectStorage {
     let expiresIn = this.config.urlTtlSeconds;
     if (expiresBy) {
       expiresIn = Math.min(expiresIn, Math.floor((expiresBy.getTime() - signingDate.getTime()) / 1_000));
+      if (expiresIn < 1) throw new Error("Original retention expires too soon to sign a GET URL");
     }
 
     if (credentials.expiration !== undefined) {

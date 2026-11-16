@@ -3,6 +3,7 @@
  */
 
 import type { Db } from "./db.ts";
+import { MEDIA_ORIGINAL_TTL_MS } from "./media/limits.ts";
 import { mediaSourceFingerprint, postLink, searchableText, type PostMedia, type PostRecord } from "./telegram/normalize.ts";
 
 export interface Channel {
@@ -560,25 +561,27 @@ export class Store {
   }
 
   async expiredMediaObjectKeys(bucket: string, cutoff: Date): Promise<string[]> {
+    const now = new Date(cutoff.getTime() + MEDIA_ORIGINAL_TTL_MS);
     const rows = await this.db.query<{ key: string }>(
       `SELECT DISTINCT object_key AS key FROM media_assets
        WHERE bucket = $1 AND object_key IS NOT NULL AND stored_at <= $2
        UNION SELECT object_key AS key FROM media_object_leases
-       WHERE bucket = $1 AND expires_at <= $2::timestamptz + interval '1 hour'`,
-      [bucket, cutoff],
+       WHERE bucket = $1 AND expires_at <= $3`,
+      [bucket, cutoff, now],
     );
     return rows.map((row) => row.key);
   }
 
   async protectedMediaObjectKeys(bucket: string, cutoff: Date): Promise<string[]> {
+    const now = new Date(cutoff.getTime() + MEDIA_ORIGINAL_TTL_MS);
     const rows = await this.db.query<{ key: string }>(
       `SELECT DISTINCT a.object_key AS key FROM media_assets a
        WHERE a.bucket = $1 AND a.object_key IS NOT NULL
-         AND (a.stored_at > $2 OR a.retained_until > $2::timestamptz + interval '1 hour'
+         AND (a.stored_at > $2 OR a.retained_until > $3
            OR EXISTS (SELECT 1 FROM chunks c WHERE c.media_asset_id = a.asset_id))
        UNION SELECT object_key AS key FROM media_object_leases
-       WHERE bucket = $1 AND expires_at > $2::timestamptz + interval '1 hour'`,
-      [bucket, cutoff],
+       WHERE bucket = $1 AND expires_at > $3`,
+      [bucket, cutoff, now],
     );
     return rows.map((row) => row.key);
   }
@@ -609,17 +612,18 @@ export class Store {
     cutoff: Date,
     remove: () => Promise<void>,
   ): Promise<boolean> {
+    const now = new Date(cutoff.getTime() + MEDIA_ORIGINAL_TTL_MS);
     const [protectedObject] = await this.db.query(
       `SELECT 1 FROM media_assets a
        WHERE a.bucket = $1 AND a.object_key = $2
-         AND (a.stored_at > $3 OR a.retained_until > $3::timestamptz + interval '1 hour' OR EXISTS (
+         AND (a.stored_at > $3 OR a.retained_until > $4 OR EXISTS (
            SELECT 1 FROM chunks c WHERE c.media_asset_id = a.asset_id
          ))
        UNION ALL
        SELECT 1 FROM media_object_leases WHERE bucket = $1 AND object_key = $2
-         AND expires_at > $3::timestamptz + interval '1 hour'
+         AND expires_at > $4
        LIMIT 1`,
-      [bucket, key, cutoff],
+      [bucket, key, cutoff, now],
     );
     if (protectedObject) return false;
     // При сбое S3 ссылки в базе не меняются; следующий проход повторит удаление.

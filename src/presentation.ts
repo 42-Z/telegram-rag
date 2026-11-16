@@ -1,5 +1,6 @@
 import type { ObjectStorage } from "./storage.ts";
 import type { MediaAsset, Post, Store } from "./store.ts";
+import { MEDIA_ORIGINAL_TTL_MS } from "./media/limits.ts";
 
 const DOWNLOADABLE_TYPES = new Set([
   "photo",
@@ -86,7 +87,7 @@ async function presentMedia(
   }
 
   const expiresBy = asset.embeddingStatus === "done" ? undefined : new Date(Math.max(
-    asset.storedAt ? new Date(asset.storedAt).getTime() + 3_600_000 : 0,
+    asset.storedAt ? new Date(asset.storedAt).getTime() + MEDIA_ORIGINAL_TTL_MS : 0,
     asset.retainedUntil ? new Date(asset.retainedUntil).getTime() : 0,
   ));
   const cacheKey = `${asset.bucket}:${asset.objectKey}:${expiresBy?.getTime() ?? ""}`;

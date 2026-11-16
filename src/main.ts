@@ -151,7 +151,8 @@ async function cleanupOriginals(): Promise<void> {
   }
 }
 void cleanupOriginals();
-const mediaCleanup = setInterval(() => void cleanupOriginals(), 60_000);
+const MEDIA_CLEANUP_INTERVAL_MS = 60_000;
+const mediaCleanup = setInterval(() => void cleanupOriginals(), MEDIA_CLEANUP_INTERVAL_MS);
 mediaCleanup.unref();
 
 if (ingestor) {

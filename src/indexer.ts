@@ -9,7 +9,7 @@ import { join } from "node:path";
 import type { Embedder, EmbeddingInput } from "./embeddings.ts";
 import { chunkHeader, buildChunks } from "./chunks.ts";
 import { logger } from "./log.ts";
-import { formatMediaSize } from "./media/limits.ts";
+import { formatMediaSize, MEDIA_ORIGINAL_TTL_MS } from "./media/limits.ts";
 import { MediaGate } from "./media/gate.ts";
 import { MEDIA_TYPES, inspectMedia, mediaFileName, mediaModality, prepareMediaChunks, sniffMimeType } from "./media/prepare.ts";
 import { type MediaProbe } from "./media/ffmpeg.ts";
@@ -405,7 +405,7 @@ export class Indexer {
       const asset = await this.store.getMediaAsset(post.channelId, post.messageId);
       if (asset?.storageStatus === "stored" && asset.objectKey) {
         if (await this.options.storage.hasOriginal(asset.objectKey)) {
-          await this.store.retainMediaObject(asset.bucket, asset.objectKey, new Date(Date.now() + 3_600_000));
+          await this.store.retainMediaObject(asset.bucket, asset.objectKey, new Date(Date.now() + MEDIA_ORIGINAL_TTL_MS));
           return;
         }
         await this.store.markMediaStorageFailed(assetRef(job), "оригинал отсутствует в S3", { allowStored: true });
@@ -438,7 +438,7 @@ export class Indexer {
   private async cleanupOriginalsWork(now: Date): Promise<number> {
     const storage = this.options.storage;
     if (!storage) return 0;
-    const cutoff = new Date(now.getTime() - 3_600_000);
+    const cutoff = new Date(now.getTime() - MEDIA_ORIGINAL_TTL_MS);
     let removed = 0;
     const visited = new Set<string>();
     const protectedKeys = new Set(await this.store.protectedMediaObjectKeys(storage.bucket, cutoff));
