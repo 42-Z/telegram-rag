@@ -18,22 +18,30 @@ import { DIMENSIONS, fakeEmbedder, freshStore, message, seed } from "./helpers.t
 const { db, store } = await freshStore();
 const embedder = fakeEmbedder();
 let signedCount = 0;
+const originalTimestamps = new Map<string, Date>();
 const storage: ObjectStorage = {
   bucket: "test-media",
   async saveOriginal(input: SaveOriginalInput): Promise<StoredOriginal> {
     const sha256 = createHash("sha256").update(input.bytes).digest("hex");
+    originalTimestamps.set(`sha256/${sha256}`, new Date());
     return { key: `sha256/${sha256}`, sha256, size: input.bytes.byteLength, contentType: input.contentType };
   },
   async saveOriginalFile(input) {
     const bytes = await readFile(input.path);
     const sha256 = createHash("sha256").update(bytes).digest("hex");
+    originalTimestamps.set(`sha256/${sha256}`, new Date());
     return { key: `sha256/${sha256}`, sha256, size: bytes.byteLength, contentType: input.contentType };
   },
   async readOriginal() { return Buffer.from("photo-original"); },
+  async hasOriginal(key) { return originalTimestamps.has(key); },
   async signGet(key) {
     signedCount += 1;
     return { url: `https://objects.example.test/${key}?signature=${signedCount}`, expiresIn: 3600, expiresAt: new Date(Date.now() + 3_600_000) };
   },
+  async *listOriginals() {
+    for (const [key, modifiedAt] of originalTimestamps) yield { key, modifiedAt };
+  },
+  async deleteOriginal(key) { originalTimestamps.delete(key); },
   async close() {},
 };
 const indexer = new Indexer(store, embedder, {
@@ -68,7 +76,7 @@ beforeAll(async () => {
   }))]);
   while ((await indexer.runOnce()) > 0);
   const bytes = Buffer.from("photo-original");
-  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  const { sha256 } = await storage.saveOriginal({ bytes, contentType: "image/png" });
   const photoPost = await store.getPost(1001, 3);
   await store.saveMediaAssetFile({
     channelId: 1001,

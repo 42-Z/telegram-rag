@@ -16,12 +16,14 @@ const CHANNEL_ID = 9500;
 
 function makeStorage() {
   const objects = new Map<string, Buffer>();
+  const timestamps = new Map<string, Date>();
   const storage: ObjectStorage = {
     bucket: "test-media",
     async saveOriginal(input: SaveOriginalInput): Promise<StoredOriginal> {
       const sha256 = createHash("sha256").update(input.bytes).digest("hex");
       const key = `sha256/${sha256}`;
       objects.set(key, Buffer.from(input.bytes));
+      timestamps.set(key, new Date());
       return { key, sha256, size: input.bytes.byteLength, contentType: input.contentType };
     },
     async saveOriginalFile(input) {
@@ -29,6 +31,7 @@ function makeStorage() {
       const sha256 = createHash("sha256").update(bytes).digest("hex");
       const key = `sha256/${sha256}`;
       objects.set(key, bytes);
+      timestamps.set(key, new Date());
       return { key, sha256, size: bytes.byteLength, contentType: input.contentType };
     },
     async readOriginal(key) {
@@ -36,12 +39,20 @@ function makeStorage() {
       if (!bytes) throw new Error("missing object");
       return bytes;
     },
+    async hasOriginal(key) { return objects.has(key); },
     async signGet(key) {
       return {
         url: `https://objects.example.test/${key}?signed=1`,
         expiresIn: 60,
         expiresAt: new Date(Date.now() + 60_000),
       };
+    },
+    async *listOriginals() {
+      for (const key of objects.keys()) yield { key, modifiedAt: timestamps.get(key)! };
+    },
+    async deleteOriginal(key) {
+      objects.delete(key);
+      timestamps.delete(key);
     },
     async close() {},
   };

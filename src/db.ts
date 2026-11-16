@@ -296,6 +296,13 @@ CREATE TABLE IF NOT EXISTS media_assets (
     REFERENCES posts (channel_id, message_id) ON DELETE CASCADE
 );
 ALTER TABLE media_assets ADD COLUMN IF NOT EXISTS source_fingerprint text;
+ALTER TABLE media_assets ADD COLUMN IF NOT EXISTS retained_until timestamptz;
+CREATE TABLE IF NOT EXISTS media_object_leases (
+  bucket      text NOT NULL,
+  object_key  text NOT NULL,
+  expires_at  timestamptz NOT NULL,
+  PRIMARY KEY (bucket, object_key)
+);
 
 CREATE INDEX IF NOT EXISTS posts_channel_date ON posts (channel_id, date DESC);
 CREATE INDEX IF NOT EXISTS posts_channel_date_id ON posts (channel_id, date DESC, message_id DESC);
@@ -306,6 +313,10 @@ CREATE INDEX IF NOT EXISTS posts_pending ON posts (channel_id, message_id)
   WHERE embedded_hash IS DISTINCT FROM index_hash AND NOT deleted;
 CREATE INDEX IF NOT EXISTS media_assets_storage_pending ON media_assets (updated_at)
   WHERE storage_status IN ('pending', 'failed');
+CREATE INDEX IF NOT EXISTS media_assets_object ON media_assets (bucket, object_key)
+  WHERE object_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS media_assets_retention ON media_assets (bucket, stored_at)
+  WHERE object_key IS NOT NULL;
 `;
 
 function chunksSchema(dimensions: number): string {
@@ -330,6 +341,7 @@ CREATE TABLE IF NOT EXISTS chunks (
   PRIMARY KEY (channel_id, message_id, chunk_index),
   FOREIGN KEY (channel_id, message_id) REFERENCES posts (channel_id, message_id) ON DELETE CASCADE
 );
+CREATE INDEX IF NOT EXISTS chunks_media_asset ON chunks (media_asset_id) WHERE media_asset_id IS NOT NULL;
 ${
   // HNSW в pgvector индексирует vector не длиннее 2000 измерений.
   dimensions <= 2000

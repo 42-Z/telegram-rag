@@ -58,6 +58,10 @@ const storage = createObjectStorage({
   },
   forcePathStyle: config.S3_FORCE_PATH_STYLE,
   urlTtlSeconds: config.S3_URL_TTL_SECONDS,
+  beforeSign: async (key, expiresAt) => {
+    if (!indexer) throw new Error("индексатор ещё не запущен");
+    await indexer.retainOriginalForLink(key, expiresAt);
+  },
 });
 
 const embedder = createEmbedder(config.embedding);
@@ -138,6 +142,19 @@ if (source) {
   log.info(`единая очередь: оригиналы всех типов в S3, векторы для ${config.embedding.modalities.join(", ")}`);
 }
 
+async function cleanupOriginals(): Promise<void> {
+  try {
+    const removed = await indexer!.cleanupOriginals();
+    if (removed) log.info(`удалено временных оригиналов без медиа-векторов: ${removed}`);
+  } catch (error) {
+    log.warn("не удалось очистить временные оригиналы", error);
+  }
+}
+void cleanupOriginals();
+const MEDIA_CLEANUP_INTERVAL_MS = 60_000;
+const mediaCleanup = setInterval(() => void cleanupOriginals(), MEDIA_CLEANUP_INTERVAL_MS);
+mediaCleanup.unref();
+
 if (ingestor) {
   void ingestor.start(config.TELEGRAM_CHANNELS).then(() => indexer?.start()).catch((error) => {
     log.error("Telegram не запустился — проверьте TELEGRAM_* и сессию (npm run login)", error);
@@ -185,6 +202,7 @@ async function shutdown(signal: string) {
   }, SHUTDOWN_TIMEOUT_MS).unref();
   server.close();
   clearInterval(guestCleanup);
+  clearInterval(mediaCleanup);
   await indexer?.stop().catch(() => {});
   await ingestor?.stop().catch(() => {});
   await storage.close().catch(() => {});

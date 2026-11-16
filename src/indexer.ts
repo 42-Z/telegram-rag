@@ -9,7 +9,8 @@ import { join } from "node:path";
 import type { Embedder, EmbeddingInput } from "./embeddings.ts";
 import { chunkHeader, buildChunks } from "./chunks.ts";
 import { logger } from "./log.ts";
-import { formatMediaSize } from "./media/limits.ts";
+import { formatMediaSize, MEDIA_ORIGINAL_TTL_MS } from "./media/limits.ts";
+import { MediaGate } from "./media/gate.ts";
 import { MEDIA_TYPES, inspectMedia, mediaFileName, mediaModality, prepareMediaChunks, sniffMimeType } from "./media/prepare.ts";
 import { type MediaProbe } from "./media/ffmpeg.ts";
 import type { PreparedMediaChunk } from "./media/prepare.ts";
@@ -68,6 +69,8 @@ export class Indexer {
   private timer: NodeJS.Timeout | undefined;
   private loopPromise: Promise<void> | undefined;
   private readonly originalTasks = new Map<string, Promise<SavedOriginal | undefined>>();
+  private readonly mediaGate = new MediaGate();
+  private cleanupPromise: Promise<number> | undefined;
   private readonly store: Store;
   private readonly embedder: Embedder;
   private readonly options: IndexerOptions;
@@ -89,15 +92,21 @@ export class Indexer {
         const index = next++;
         const post = posts[index];
         if (!post) return;
-      try {
-        await this.processPost(post);
-      } catch (error) {
+        try {
+          await this.mediaGate.use(() => this.processPost(post));
+        } catch (error) {
           const current = await this.store.markEmbedErrorIfCurrent(post, String(error));
           if (current) log.warn(`не проиндексирован пост ${post.channelId}/${post.messageId}`, error);
         }
       }
     });
     await Promise.all(workers);
+    try {
+      if (this.cleanupPromise) await this.cleanupPromise;
+      await this.cleanupOriginals();
+    } catch (error) {
+      log.warn("не удалось очистить временные оригиналы после индексации", error);
+    }
     return posts.length;
   }
 
@@ -364,10 +373,27 @@ export class Indexer {
    * Предел архива — 2048 МиБ; вектор появится позже, если вложение
    * укладывается в предел векторного поиска.
    */
-  async ensureOriginal(post: Post): Promise<void> {
+  ensureOriginal(post: Post): Promise<void> {
+    if (!post.media || !MEDIA_TYPES.includes(post.media.type) || !this.options.storage) return Promise.resolve();
+    return this.mediaGate.use(() => this.ensureOriginalWork(post));
+  }
+
+  async retainOriginalForLink(key: string, expiresAt: Date): Promise<void> {
+    await this.mediaGate.use(async () => {
+      const storage = this.options.storage;
+      if (
+        !storage ||
+        !await storage.hasOriginal(key) ||
+        !await this.store.retainMediaObject(storage.bucket, key, expiresAt)
+      ) {
+        throw new Error("оригинал уже удалён; запросите пост повторно");
+      }
+    });
+  }
+
+  private async ensureOriginalWork(post: Post): Promise<void> {
     const media = post.media;
     if (!media || !MEDIA_TYPES.includes(media.type) || !this.options.storage) return;
-    if (!this.options.downloadMedia && !this.options.downloadMediaToFile) return;
     const job: MediaJob = {
       channelId: post.channelId,
       messageId: post.messageId,
@@ -377,7 +403,14 @@ export class Indexer {
     };
     try {
       const asset = await this.store.getMediaAsset(post.channelId, post.messageId);
-      if (asset?.storageStatus === "stored") return;
+      if (asset?.storageStatus === "stored" && asset.objectKey) {
+        if (await this.options.storage.hasOriginal(asset.objectKey)) {
+          await this.store.retainMediaObject(asset.bucket, asset.objectKey, new Date(Date.now() + MEDIA_ORIGINAL_TTL_MS));
+          return;
+        }
+        await this.store.markMediaStorageFailed(assetRef(job), "оригинал отсутствует в S3", { allowStored: true });
+      }
+      if (!this.options.downloadMedia && !this.options.downloadMediaToFile) return;
       const original = await this.saveOriginal(job, true);
       if (!original) return;
       const skipReason = original.skipReason ?? this.embeddingSkipReason(job, original);
@@ -391,6 +424,46 @@ export class Indexer {
       await this.store.markMediaStorageFailed(assetRef(job), String(error));
       log.warn(`вложение ${post.channelId}/${post.messageId} не сохранено по прямому запросу`, error);
     }
+  }
+
+  /** Удаляет также сиротские оригиналы, потерявшие запись при правке/удалении поста. */
+  cleanupOriginals(now = new Date()): Promise<number> {
+    if (this.cleanupPromise) return this.cleanupPromise;
+    this.cleanupPromise = this.cleanupOriginalsWork(now).finally(() => {
+      this.cleanupPromise = undefined;
+    });
+    return this.cleanupPromise;
+  }
+
+  private async cleanupOriginalsWork(now: Date): Promise<number> {
+    const storage = this.options.storage;
+    if (!storage) return 0;
+    const cutoff = new Date(now.getTime() - MEDIA_ORIGINAL_TTL_MS);
+    let removed = 0;
+    const visited = new Set<string>();
+    const protectedKeys = new Set(await this.store.protectedMediaObjectKeys(storage.bucket, cutoff));
+    const expire = async (key: string): Promise<void> => {
+      if (protectedKeys.has(key) || visited.has(key) || this.stopped) return;
+      visited.add(key);
+      try {
+        const expired = await this.mediaGate.tryExclusive(() => this.store.expireMediaObject(
+          storage.bucket, key, cutoff, () => storage.deleteOriginal(key),
+        ));
+        if (expired) removed++;
+      } catch (error) {
+        log.warn(`не удалось удалить временный оригинал ${key}`, error);
+      }
+    };
+    // Повторяем и незавершённое обновление БД после успешного удаления в S3.
+    for (const key of await this.store.expiredMediaObjectKeys(storage.bucket, cutoff)) {
+      await expire(key);
+      if (this.stopped) return removed;
+    }
+    for await (const object of storage.listOriginals()) {
+      if (this.stopped) break;
+      if (object.modifiedAt <= cutoff) await expire(object.key);
+    }
+    return removed;
   }
 
   /**
@@ -492,6 +565,8 @@ export class Indexer {
     clearTimeout(this.timer);
     this.wake?.();
     await this.loopPromise;
+    await this.cleanupPromise;
+    await this.mediaGate.exclusive(async () => {});
     this.loopPromise = undefined;
   }
 }
