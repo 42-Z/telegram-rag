@@ -10,6 +10,7 @@ import { Indexer, type IndexerOptions } from "../src/indexer.ts";
 import { presentPostMedia } from "../src/presentation.ts";
 import type { ObjectStorage, SaveOriginalInput, StoredOriginal } from "../src/storage.ts";
 import { mediaSourceFingerprint, normalizeMessage, type PostMedia } from "../src/telegram/normalize.ts";
+import { callTool } from "../src/tools.ts";
 import { fakeEmbedder, freshStore, message } from "./helpers.ts";
 
 // Подмена подготовки медиа нужна одному тесту: ffmpeg сложно заставить упасть на середине файла.
@@ -74,6 +75,7 @@ const mediaFor = (type: string, fileId: number, mimeType: string, duration: numb
 
 function makeStorage() {
   const objects = new Map<string, { bytes: Buffer; mimeType: string }>();
+  const timestamps = new Map<string, Date>();
   const storage: ObjectStorage = {
     bucket: "test-media",
     async saveOriginal(input: SaveOriginalInput): Promise<StoredOriginal> {
@@ -81,6 +83,7 @@ function makeStorage() {
       const key = `sha256/${sha256}`;
       const bytes = Buffer.from(input.bytes);
       objects.set(key, { bytes, mimeType: input.contentType });
+      timestamps.set(key, new Date());
       return { key, sha256, size: bytes.byteLength, contentType: input.contentType };
     },
     async saveOriginalFile(input) {
@@ -88,6 +91,7 @@ function makeStorage() {
       const sha256 = createHash("sha256").update(bytes).digest("hex");
       const key = `sha256/${sha256}`;
       objects.set(key, { bytes, mimeType: input.contentType });
+      timestamps.set(key, new Date());
       return { key, sha256, size: bytes.byteLength, contentType: input.contentType };
     },
     async readOriginal(key) {
@@ -95,12 +99,20 @@ function makeStorage() {
       if (!object) throw new Error("missing test object");
       return Buffer.from(object.bytes);
     },
+    async hasOriginal(key) { return objects.has(key); },
     async signGet(key) {
       return { url: `https://objects.example.test/${key}?signed=1`, expiresIn: 60, expiresAt: new Date(Date.now() + 60_000) };
     },
+    async *listOriginals() {
+      for (const key of objects.keys()) yield { key, modifiedAt: timestamps.get(key)! };
+    },
+    async deleteOriginal(key) {
+      objects.delete(key);
+      timestamps.delete(key);
+    },
     async close() {},
   };
-  return { storage, objects };
+  return { storage, objects, timestamps };
 }
 
 function indexerOptions(
@@ -663,6 +675,382 @@ describe("direct media embedding pipeline", () => {
       await db.close();
     }
   }, 30_000);
+});
+
+describe("original retention", () => {
+  const now = new Date("2030-01-01T12:00:00Z");
+  const expiredAt = new Date(now.getTime() - 3_600_000);
+
+  async function setup(maxEmbedBytes = 1) {
+    const { db, store } = await freshStore();
+    try {
+      await store.upsertChannel({
+        id: 9020, ref: "@retention", username: "retention", title: "Хранение", about: null, accessHash: "1",
+      });
+      await store.upsertPosts([
+        normalizeMessage(9020, message(1, "Подпись сохраняется в поиске", {
+          media: mediaFor("photo", 2, "image/png", 0, "photo.png"),
+        })),
+      ]);
+      const fake = makeStorage();
+      const download = vi.fn(async () => photo);
+      const indexer = new Indexer(store, fakeEmbedder(), indexerOptions(fake.storage, download, { maxEmbedBytes }));
+      await indexer.ensureOriginal((await store.getPost(9020, 1))!);
+      await indexer.runOnce();
+      const asset = (await store.getMediaAsset(9020, 1))!;
+      const age = async (date = expiredAt) => {
+        fake.timestamps.set(asset.objectKey!, date);
+        await db.query("UPDATE media_assets SET stored_at = $1 WHERE object_key = $2", [date, asset.objectKey]);
+      };
+      await age();
+      return { db, store, indexer, download, asset: (await store.getMediaAsset(9020, 1))!, age, ...fake };
+    } catch (error) {
+      await db.close();
+      throw error;
+    }
+  }
+
+  it("expires an unindexed original at one hour even when its post has text chunks", async () => {
+    const { db, store, indexer, objects, asset } = await setup();
+    try {
+      expect(await db.query("SELECT kind FROM chunks WHERE channel_id = 9020")).toEqual([{ kind: "text" }]);
+      expect(await indexer.cleanupOriginals(now)).toBe(1);
+      expect(objects.has(asset.objectKey!)).toBe(false);
+      expect(await store.getMediaAsset(9020, 1)).toMatchObject({
+        objectKey: null, sha256: null, storedAt: null, storageStatus: "skipped", embeddingStatus: "skipped",
+      });
+      expect(await db.query("SELECT kind FROM chunks WHERE channel_id = 9020")).toEqual([{ kind: "text" }]);
+      expect(await indexer.cleanupOriginals(now)).toBe(0);
+    } finally {
+      await db.close();
+    }
+  });
+
+  it("keeps an old original with actual media vectors", async () => {
+    const { db, store, indexer, objects, asset } = await setup(20 * 1_048_576);
+    try {
+      expect(await db.query("SELECT kind FROM chunks WHERE media_asset_id = $1", [asset.assetId]))
+        .toEqual([{ kind: "image" }]);
+      expect(await indexer.cleanupOriginals(now)).toBe(0);
+      expect(objects.has(asset.objectKey!)).toBe(true);
+      expect(await store.getMediaAsset(9020, 1)).toEqual(asset);
+    } finally {
+      await db.close();
+    }
+  });
+
+  it("keeps originals younger than one hour and expires them at the boundary", async () => {
+    const { db, indexer, objects, asset, age } = await setup();
+    try {
+      await age(new Date(expiredAt.getTime() + 1));
+      expect(await indexer.cleanupOriginals(now)).toBe(0);
+      expect(objects.has(asset.objectKey!)).toBe(true);
+      expect(await indexer.cleanupOriginals(new Date(now.getTime() + 1))).toBe(1);
+    } finally {
+      await db.close();
+    }
+  });
+
+  it("protects a recently stored DB reference even when the S3 timestamp is old", async () => {
+    const { db, indexer, objects, asset } = await setup();
+    try {
+      await db.query("UPDATE media_assets SET stored_at = $1 WHERE object_key = $2", [now, asset.objectKey]);
+      expect(await indexer.cleanupOriginals(now)).toBe(0);
+      expect(objects.has(asset.objectKey!)).toBe(true);
+    } finally {
+      await db.close();
+    }
+  });
+
+  it("redownloads an expired original on demand without restarting background downloads", async () => {
+    const { db, store, indexer, objects, asset, download } = await setup();
+    try {
+      expect(download).toHaveBeenCalledTimes(1);
+      const post = (await store.getPost(9020, 1))!;
+      expect(await indexer.cleanupOriginals(now)).toBe(1);
+      expect(await indexer.runOnce()).toBe(0);
+      expect(await indexer.runOnce()).toBe(0);
+      expect(download).toHaveBeenCalledTimes(1);
+
+      await indexer.ensureOriginal(post);
+      await indexer.ensureOriginal(post);
+      expect(download).toHaveBeenCalledTimes(2);
+      expect(await store.getMediaAsset(9020, 1)).toMatchObject({
+        storageStatus: "stored", embeddingStatus: "skipped", objectKey: asset.objectKey,
+      });
+      expect(objects.get(asset.objectKey!)?.bytes).toEqual(photo);
+      expect(await indexer.runOnce()).toBe(0);
+      expect(download).toHaveBeenCalledTimes(2);
+    } finally {
+      await db.close();
+    }
+  });
+
+  it("keeps a shared object when another asset has media vectors", async () => {
+    const { db, store, indexer, storage, objects, asset, age } = await setup(20 * 1_048_576);
+    try {
+      await store.upsertPosts([
+        normalizeMessage(9020, message(2, "Тот же файл без вектора", {
+          media: mediaFor("photo", 8, "image/png", 0, "shared.png"),
+        })),
+      ]);
+      const direct = new Indexer(store, fakeEmbedder(), indexerOptions(storage, async () => photo, { maxEmbedBytes: 1 }));
+      await direct.ensureOriginal((await store.getPost(9020, 2))!);
+      await age();
+      const shared = (await store.getMediaAsset(9020, 2))!;
+      expect(shared).toMatchObject({ objectKey: asset.objectKey, embeddingStatus: "skipped" });
+      expect(await db.query("SELECT kind FROM chunks WHERE media_asset_id = $1", [shared.assetId])).toEqual([]);
+      expect(await indexer.cleanupOriginals(now)).toBe(0);
+      expect(objects.has(asset.objectKey!)).toBe(true);
+      expect(await store.getMediaAsset(9020, 2)).toEqual(shared);
+    } finally {
+      await db.close();
+    }
+  });
+
+  it("removes old orphan objects but keeps fresh orphans", async () => {
+    const { db, indexer, storage, objects, timestamps } = await setup();
+    try {
+      const old = await storage.saveOriginal({ bytes: Buffer.from("old orphan"), contentType: "application/pdf" });
+      const fresh = await storage.saveOriginal({ bytes: Buffer.from("fresh orphan"), contentType: "application/pdf" });
+      timestamps.set(old.key, expiredAt);
+      timestamps.set(fresh.key, now);
+      expect(await indexer.cleanupOriginals(now)).toBe(2);
+      expect(objects.has(old.key)).toBe(false);
+      expect(objects.has(fresh.key)).toBe(true);
+    } finally {
+      await db.close();
+    }
+  });
+
+  it("leaves DB metadata intact after deletion fails and retries on the next cleanup", async () => {
+    const { db, store, indexer, storage, objects, asset } = await setup();
+    try {
+      const before = await store.getMediaAsset(9020, 1);
+      const remove = vi.spyOn(storage, "deleteOriginal").mockRejectedValueOnce(new Error("S3 unavailable"));
+      expect(await indexer.cleanupOriginals(now)).toBe(0);
+      expect(await store.getMediaAsset(9020, 1)).toEqual(before);
+      expect(objects.has(asset.objectKey!)).toBe(true);
+      expect(await indexer.cleanupOriginals(now)).toBe(1);
+      expect(remove).toHaveBeenCalledTimes(2);
+      expect(await store.getMediaAsset(9020, 1)).toMatchObject({ objectKey: null, storageStatus: "skipped" });
+    } finally {
+      await db.close();
+    }
+  });
+
+  it("repairs DB metadata on the next cleanup when S3 deletion succeeded but the DB update failed", async () => {
+    const { db, store, indexer, objects, asset } = await setup();
+    const query = db.query.bind(db);
+    let failUpdate = true;
+    const spy = vi.spyOn(db, "query").mockImplementation(async <T>(sql: string, params?: readonly unknown[]): Promise<T[]> => {
+      if (failUpdate && sql.includes("UPDATE media_assets SET object_key = NULL")) {
+        failUpdate = false;
+        throw new Error("database temporarily unavailable");
+      }
+      return query<T>(sql, params);
+    });
+    try {
+      const before = await store.getMediaAsset(9020, 1);
+      expect(await indexer.cleanupOriginals(now)).toBe(0);
+      expect(objects.has(asset.objectKey!)).toBe(false);
+      expect(await store.getMediaAsset(9020, 1)).toEqual(before);
+
+      expect(await indexer.cleanupOriginals(now)).toBe(1);
+      expect(await store.getMediaAsset(9020, 1)).toMatchObject({
+        objectKey: null, sha256: null, storedAt: null, storageStatus: "skipped",
+      });
+    } finally {
+      spy.mockRestore();
+      await db.close();
+    }
+  });
+
+  it("redownloads on request when S3 deletion succeeded but the stored DB reference survived a failed update", async () => {
+    const { db, store, indexer, storage, objects, asset, download } = await setup();
+    const query = db.query.bind(db);
+    let failUpdate = true;
+    const spy = vi.spyOn(db, "query").mockImplementation(async <T>(sql: string, params?: readonly unknown[]): Promise<T[]> => {
+      if (failUpdate && sql.includes("UPDATE media_assets SET object_key = NULL")) {
+        failUpdate = false;
+        throw new Error("database temporarily unavailable");
+      }
+      return query<T>(sql, params);
+    });
+    const head = vi.spyOn(storage, "hasOriginal");
+    const markFailed = vi.spyOn(store, "markMediaStorageFailed");
+    try {
+      expect(await indexer.cleanupOriginals(now)).toBe(0);
+      expect(objects.has(asset.objectKey!)).toBe(false);
+      expect(await store.getMediaAsset(9020, 1)).toMatchObject({
+        storageStatus: "stored", objectKey: asset.objectKey,
+      });
+
+      const post = (await store.getPost(9020, 1))!;
+      await indexer.ensureOriginal(post);
+      expect(head).toHaveBeenCalledExactlyOnceWith(asset.objectKey);
+      expect(await head.mock.results[0]!.value).toBe(false);
+      expect(markFailed).toHaveBeenCalledWith(
+        expect.objectContaining({ channelId: 9020, messageId: 1 }),
+        expect.stringContaining("отсутствует"),
+        { allowStored: true },
+      );
+      expect(download).toHaveBeenCalledTimes(2);
+      expect(objects.get(asset.objectKey!)?.bytes).toEqual(photo);
+      expect(await store.getMediaAsset(9020, 1)).toMatchObject({
+        storageStatus: "stored", objectKey: asset.objectKey, embeddingStatus: "skipped",
+      });
+      await indexer.ensureOriginal(post);
+      expect(head).toHaveBeenCalledTimes(2);
+      expect(download).toHaveBeenCalledTimes(2);
+    } finally {
+      markFailed.mockRestore();
+      head.mockRestore();
+      spy.mockRestore();
+      await db.close();
+    }
+  });
+
+  it("keeps a renewed orphan until the issued link expires even after its asset is deleted", async () => {
+    const { db, store, indexer, storage, objects, timestamps, asset } = await setup();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now.getTime());
+    try {
+      await indexer.ensureOriginal((await store.getPost(9020, 1))!);
+      const expiresAt = new Date(now.getTime() + 3_600_000);
+      expect(await db.query("SELECT expires_at FROM media_object_leases WHERE object_key = $1", [asset.objectKey]))
+        .toEqual([{ expires_at: expiresAt }]);
+      await db.query("DELETE FROM media_assets WHERE channel_id = 9020 AND message_id = 1");
+      expect(await store.getMediaAsset(9020, 1)).toBeUndefined();
+      expect(timestamps.get(asset.objectKey!)).toEqual(expiredAt);
+      expect(await indexer.cleanupOriginals(new Date(expiresAt.getTime() - 1))).toBe(0);
+      expect(objects.has(asset.objectKey!)).toBe(true);
+
+      // Даже если S3 listing не показывает объект, истёкшая lease даёт ключ для удаления.
+      const list = vi.spyOn(storage, "listOriginals").mockImplementation(async function* () {});
+      try {
+        expect(await indexer.cleanupOriginals(expiresAt)).toBe(1);
+        expect(objects.has(asset.objectKey!)).toBe(false);
+        expect(await db.query("SELECT 1 FROM media_object_leases WHERE object_key = $1", [asset.objectKey])).toEqual([]);
+      } finally {
+        list.mockRestore();
+      }
+    } finally {
+      clock.mockRestore();
+      await db.close();
+    }
+  });
+
+  it("skips an in-flight upload without waiting and protects its fresh shared reference afterwards", async () => {
+    const { db, store, indexer, storage, objects, asset, age } = await setup();
+    const cleanupTime = new Date();
+    await age(new Date(cleanupTime.getTime() - 3_600_001));
+    const uploaded = Promise.withResolvers<void>();
+    const finishUpload = Promise.withResolvers<void>();
+    const saveOriginal = storage.saveOriginal.bind(storage);
+    const save = vi.spyOn(storage, "saveOriginal").mockImplementation(async (input) => {
+      const result = await saveOriginal(input);
+      uploaded.resolve();
+      await finishUpload.promise;
+      return result;
+    });
+    try {
+      await store.upsertPosts([
+        normalizeMessage(9020, message(2, "Повторная загрузка общего файла", {
+          media: mediaFor("photo", 8, "image/png", 0, "shared.png"),
+        })),
+      ]);
+      const loading = indexer.ensureOriginal((await store.getPost(9020, 2))!);
+      await uploaded.promise;
+      const expire = vi.spyOn(store, "expireMediaObject");
+      try {
+        expect(await indexer.cleanupOriginals(cleanupTime)).toBe(0);
+        expect(expire).not.toHaveBeenCalled();
+        expect(objects.has(asset.objectKey!)).toBe(true);
+        finishUpload.resolve();
+        await loading;
+        expect(await indexer.cleanupOriginals(cleanupTime)).toBe(0);
+        expect(objects.has(asset.objectKey!)).toBe(true);
+        expect(await store.getMediaAsset(9020, 2)).toMatchObject({
+          storageStatus: "stored", objectKey: asset.objectKey,
+        });
+      } finally {
+        expire.mockRestore();
+      }
+    } finally {
+      finishUpload.resolve();
+      save.mockRestore();
+      await db.close();
+    }
+  });
+
+  it("renews a stored original for an hour on each get_post and extends all shared references without downloading", async () => {
+    const { db, store, indexer, storage, objects, asset, download, age } = await setup();
+    const clock = vi.spyOn(Date, "now");
+    const sign = vi.spyOn(storage, "signGet");
+    try {
+      await store.upsertPosts([
+        normalizeMessage(9020, message(2, "Общая копия", {
+          media: mediaFor("photo", 8, "image/png", 0, "shared.png"),
+        })),
+      ]);
+      await indexer.ensureOriginal((await store.getPost(9020, 2))!);
+      await age();
+      const downloads = download.mock.calls.length;
+      const context = { store, embedder: fakeEmbedder(), storage, ensureMedia: (post: Parameters<Indexer["ensureOriginal"]>[0]) => indexer.ensureOriginal(post) };
+      const firstRequest = now.getTime() - 1_800_000;
+      clock.mockReturnValue(firstRequest);
+      await callTool("get_post", { channel: "@retention", message_id: 1 }, context);
+      const firstExpiry = new Date(firstRequest + 3_600_000);
+      for (const id of [1, 2]) {
+        expect(await store.getMediaAsset(9020, id)).toMatchObject({ retainedUntil: firstExpiry });
+      }
+      expect(sign).toHaveBeenLastCalledWith(asset.objectKey, firstExpiry);
+      expect(await indexer.cleanupOriginals(now)).toBe(0);
+
+      const secondRequest = now.getTime() + 900_000;
+      clock.mockReturnValue(secondRequest);
+      await callTool("get_post", { channel: "@retention", message_id: 2 }, context);
+      const secondExpiry = new Date(secondRequest + 3_600_000);
+      for (const id of [1, 2]) {
+        expect(await store.getMediaAsset(9020, id)).toMatchObject({
+          objectKey: asset.objectKey, retainedUntil: secondExpiry,
+        });
+      }
+      expect(sign).toHaveBeenLastCalledWith(asset.objectKey, secondExpiry);
+      expect(download).toHaveBeenCalledTimes(downloads);
+      expect(await indexer.cleanupOriginals(firstExpiry)).toBe(0);
+      expect(objects.has(asset.objectKey!)).toBe(true);
+      expect(await indexer.cleanupOriginals(secondExpiry)).toBe(1);
+      for (const id of [1, 2]) {
+        expect(await store.getMediaAsset(9020, id)).toMatchObject({ objectKey: null, retainedUntil: null });
+      }
+    } finally {
+      sign.mockRestore();
+      clock.mockRestore();
+      await db.close();
+    }
+  });
+
+  it("cleans expired originals after finishing a nonempty worker batch", async () => {
+    const { db, store, indexer, storage, objects, asset, age } = await setup();
+    const removeOriginal = storage.deleteOriginal.bind(storage);
+    const remove = vi.spyOn(storage, "deleteOriginal").mockImplementation(async (key) => {
+      expect(await db.query("SELECT kind FROM chunks WHERE channel_id = 9020 AND message_id = 3"))
+        .toEqual([{ kind: "text" }]);
+      await removeOriginal(key);
+    });
+    try {
+      await age(new Date(Date.now() - 3_600_001));
+      await store.upsertPosts([normalizeMessage(9020, message(3, "Следующая работа в очереди"))]);
+      expect(await indexer.runOnce()).toBe(1);
+      expect(remove).toHaveBeenCalledExactlyOnceWith(asset.objectKey);
+      expect(objects.has(asset.objectKey!)).toBe(false);
+      expect(await store.getMediaAsset(9020, 1)).toMatchObject({ storageStatus: "skipped", objectKey: null });
+    } finally {
+      remove.mockRestore();
+      await db.close();
+    }
+  });
 });
 
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
