@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
-import { GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { DeleteObjectCommand, GetObjectCommand, HeadObjectCommand, ListObjectsV2Command, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { NodeHttpHandler } from "@smithy/node-http-handler";
 import type { AwsCredentialIdentity, AwsCredentialIdentityProvider } from "@smithy/types";
@@ -21,6 +21,7 @@ export interface S3StorageConfig {
   credentials: AwsCredentialIdentity | AwsCredentialIdentityProvider;
   forcePathStyle: boolean;
   urlTtlSeconds: number;
+  beforeSign?: (key: string, expiresAt: Date) => Promise<void>;
 }
 
 export interface SaveOriginalInput {
@@ -57,7 +58,10 @@ export interface ObjectStorage {
   /** Streaming upload for originals that must not be loaded into memory whole. */
   saveOriginalFile(input: SaveOriginalFileInput): Promise<StoredOriginal>;
   readOriginal(key: string): Promise<Buffer>;
-  signGet(key: string): Promise<SignedGetUrl>;
+  hasOriginal(key: string): Promise<boolean>;
+  signGet(key: string, expiresBy?: Date): Promise<SignedGetUrl>;
+  listOriginals(): AsyncIterable<{ key: string; modifiedAt: Date }>;
+  deleteOriginal(key: string): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -143,13 +147,55 @@ class S3ObjectStorage implements ObjectStorage {
     return Buffer.from(await result.Body.transformToByteArray());
   }
 
-  async signGet(key: string): Promise<SignedGetUrl> {
+  async *listOriginals(): AsyncIterable<{ key: string; modifiedAt: Date }> {
+    this.assertOpen();
+    let token: string | undefined;
+    do {
+      const page = await this.client.send(new ListObjectsV2Command({
+        Bucket: this.bucket,
+        Prefix: "sha256/",
+        ContinuationToken: token,
+      }));
+      for (const object of page.Contents ?? []) {
+        if (object.Key && OBJECT_KEY_PATTERN.test(object.Key) && object.LastModified) {
+          yield { key: object.Key, modifiedAt: object.LastModified };
+        }
+      }
+      if (page.IsTruncated && !page.NextContinuationToken) {
+        throw new Error("S3 returned a truncated object list without a continuation token");
+      }
+      token = page.IsTruncated ? page.NextContinuationToken : undefined;
+    } while (token);
+  }
+
+  async hasOriginal(key: string): Promise<boolean> {
+    this.assertOpen();
+    this.assertObjectKey(key);
+    try {
+      await this.client.send(new HeadObjectCommand({ Bucket: this.bucket, Key: key }));
+      return true;
+    } catch (error) {
+      if ((error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode === 404) return false;
+      throw error;
+    }
+  }
+
+  async deleteOriginal(key: string): Promise<void> {
+    this.assertOpen();
+    this.assertObjectKey(key);
+    await this.client.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: key }));
+  }
+
+  async signGet(key: string, expiresBy?: Date): Promise<SignedGetUrl> {
     this.assertOpen();
     this.assertObjectKey(key);
 
     const credentials = await this.resolveCredentials();
     const signingDate = new Date(Math.floor(Date.now() / 1_000) * 1_000);
     let expiresIn = this.config.urlTtlSeconds;
+    if (expiresBy) {
+      expiresIn = Math.min(expiresIn, Math.floor((expiresBy.getTime() - signingDate.getTime()) / 1_000));
+    }
 
     if (credentials.expiration !== undefined) {
       const expirationMs = credentials.expiration.getTime();
@@ -158,6 +204,7 @@ class S3ObjectStorage implements ObjectStorage {
       expiresIn = Math.min(expiresIn, credentialTtl);
     }
     if (expiresIn < 1) throw new Error("S3 credentials expire too soon to sign a GET URL");
+    await this.config.beforeSign?.(key, new Date(signingDate.getTime() + expiresIn * 1_000));
 
     // Pin the signer to the credentials whose expiration was just checked.
     const signingClient = this.newClient(credentials);

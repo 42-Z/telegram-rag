@@ -61,6 +61,7 @@ export interface MediaAsset {
   storageStatus: AssetStorageStatus;
   storageError: string | null;
   storedAt: Date | null;
+  retainedUntil?: Date | null;
   embeddingStatus: AssetEmbeddingStatus;
   embeddingError: string | null;
   updatedAt: Date;
@@ -148,6 +149,7 @@ const mediaAssetColumns = (t = "") => `${t}asset_id AS "assetId", ${t}channel_id
   ${t}bucket, ${t}object_key AS "objectKey", ${t}sha256,
   ${t}mime_type AS "mimeType", ${t}file_name AS "fileName", ${t}size, ${t}duration,
   ${t}storage_status AS "storageStatus", ${t}storage_error AS "storageError", ${t}stored_at AS "storedAt",
+  ${t}retained_until AS "retainedUntil",
   ${t}embedding_status AS "embeddingStatus", ${t}embedding_error AS "embeddingError", ${t}updated_at AS "updatedAt"`;
 const MEDIA_ASSET_COLUMNS = mediaAssetColumns();
 
@@ -557,6 +559,85 @@ export class Store {
     return asset;
   }
 
+  async expiredMediaObjectKeys(bucket: string, cutoff: Date): Promise<string[]> {
+    const rows = await this.db.query<{ key: string }>(
+      `SELECT DISTINCT object_key AS key FROM media_assets
+       WHERE bucket = $1 AND object_key IS NOT NULL AND stored_at <= $2
+       UNION SELECT object_key AS key FROM media_object_leases
+       WHERE bucket = $1 AND expires_at <= $2::timestamptz + interval '1 hour'`,
+      [bucket, cutoff],
+    );
+    return rows.map((row) => row.key);
+  }
+
+  async protectedMediaObjectKeys(bucket: string, cutoff: Date): Promise<string[]> {
+    const rows = await this.db.query<{ key: string }>(
+      `SELECT DISTINCT a.object_key AS key FROM media_assets a
+       WHERE a.bucket = $1 AND a.object_key IS NOT NULL
+         AND (a.stored_at > $2 OR a.retained_until > $2::timestamptz + interval '1 hour'
+           OR EXISTS (SELECT 1 FROM chunks c WHERE c.media_asset_id = a.asset_id))
+       UNION SELECT object_key AS key FROM media_object_leases
+       WHERE bucket = $1 AND expires_at > $2::timestamptz + interval '1 hour'`,
+      [bucket, cutoff],
+    );
+    return rows.map((row) => row.key);
+  }
+
+  async retainMediaObject(bucket: string, key: string, until: Date): Promise<boolean> {
+    return this.db.transaction(async (tx) => {
+      const rows = await tx.query(
+        `UPDATE media_assets SET retained_until = GREATEST(retained_until, $3)
+         WHERE bucket = $1 AND object_key = $2 AND storage_status = 'stored' RETURNING asset_id`,
+        [bucket, key, until],
+      );
+      if (rows.length === 0) return false;
+      // Срок ссылки переживает замену вложения и удаление поста.
+      await tx.query(
+        `INSERT INTO media_object_leases (bucket, object_key, expires_at) VALUES ($1, $2, $3)
+         ON CONFLICT (bucket, object_key) DO UPDATE
+           SET expires_at = GREATEST(media_object_leases.expires_at, EXCLUDED.expires_at)`,
+        [bucket, key, until],
+      );
+      return true;
+    });
+  }
+
+  /** Вызывается под исключительной блокировкой загрузок и индексации MediaGate. */
+  async expireMediaObject(
+    bucket: string,
+    key: string,
+    cutoff: Date,
+    remove: () => Promise<void>,
+  ): Promise<boolean> {
+    const [protectedObject] = await this.db.query(
+      `SELECT 1 FROM media_assets a
+       WHERE a.bucket = $1 AND a.object_key = $2
+         AND (a.stored_at > $3 OR a.retained_until > $3::timestamptz + interval '1 hour' OR EXISTS (
+           SELECT 1 FROM chunks c WHERE c.media_asset_id = a.asset_id
+         ))
+       UNION ALL
+       SELECT 1 FROM media_object_leases WHERE bucket = $1 AND object_key = $2
+         AND expires_at > $3::timestamptz + interval '1 hour'
+       LIMIT 1`,
+      [bucket, key, cutoff],
+    );
+    if (protectedObject) return false;
+    // При сбое S3 ссылки в базе не меняются; следующий проход повторит удаление.
+    await remove();
+    await this.db.query(
+      `UPDATE media_assets SET object_key = NULL, sha256 = NULL, stored_at = NULL, retained_until = NULL,
+         storage_status = 'skipped', storage_error = 'временный оригинал удалён через час; доступен по запросу get_post',
+         embedding_status = CASE WHEN embedding_status = 'pending' THEN 'skipped' ELSE embedding_status END,
+         embedding_error = CASE WHEN embedding_status = 'pending'
+           THEN 'временный оригинал удалён до индексации; доступен по запросу get_post' ELSE embedding_error END,
+         updated_at = now()
+       WHERE bucket = $1 AND object_key = $2`,
+      [bucket, key],
+    );
+    await this.db.query("DELETE FROM media_object_leases WHERE bucket = $1 AND object_key = $2", [bucket, key]);
+    return true;
+  }
+
   async getMediaAssetsForPosts(posts: readonly Pick<Post, "channelId" | "messageId">[]): Promise<MediaAsset[]> {
     const unique = [...new Map(posts.map((post) => [`${post.channelId}:${post.messageId}`, post])).values()];
     if (unique.length === 0) return [];
@@ -642,7 +723,7 @@ export class Store {
            bucket = EXCLUDED.bucket,
            object_key = NULL, sha256 = NULL, mime_type = EXCLUDED.mime_type,
            file_name = EXCLUDED.file_name, size = EXCLUDED.size, duration = EXCLUDED.duration,
-           storage_status = 'pending', storage_error = NULL, stored_at = NULL,
+           storage_status = 'pending', storage_error = NULL, stored_at = NULL, retained_until = NULL,
            embedding_status = 'pending', embedding_error = NULL, updated_at = now()
          RETURNING ${MEDIA_ASSET_COLUMNS}`,
         [
@@ -687,7 +768,7 @@ export class Store {
            object_key = EXCLUDED.object_key, sha256 = EXCLUDED.sha256,
            mime_type = EXCLUDED.mime_type, file_name = EXCLUDED.file_name, size = EXCLUDED.size,
            duration = EXCLUDED.duration, storage_status = 'stored', storage_error = NULL,
-           stored_at = now(), embedding_status = 'pending', embedding_error = NULL, updated_at = now()
+           stored_at = now(), retained_until = NULL, embedding_status = 'pending', embedding_error = NULL, updated_at = now()
          WHERE media_assets.source_file_id IS NOT DISTINCT FROM EXCLUDED.source_file_id
            AND media_assets.source_fingerprint = EXCLUDED.source_fingerprint
          RETURNING ${MEDIA_ASSET_COLUMNS}`,
@@ -785,8 +866,10 @@ export class Store {
       await tx.query("UPDATE posts SET embed_error = NULL WHERE embed_error IS NOT NULL");
       await tx.query(
         `UPDATE media_assets SET
-           storage_status = CASE WHEN storage_status = 'failed' THEN 'pending' ELSE storage_status END,
-           storage_error = CASE WHEN storage_status = 'failed' THEN NULL ELSE storage_error END,
+           storage_status = CASE WHEN storage_status = 'failed'
+             OR (storage_status = 'skipped' AND embedding_status = 'failed') THEN 'pending' ELSE storage_status END,
+           storage_error = CASE WHEN storage_status = 'failed'
+             OR (storage_status = 'skipped' AND embedding_status = 'failed') THEN NULL ELSE storage_error END,
            embedding_status = CASE WHEN embedding_status = 'failed' THEN 'pending' ELSE embedding_status END,
            embedding_error = CASE WHEN embedding_status = 'failed' THEN NULL ELSE embedding_error END,
            updated_at = now()

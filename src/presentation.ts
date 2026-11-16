@@ -85,10 +85,14 @@ async function presentMedia(
     return clean(view);
   }
 
-  const cacheKey = `${asset.bucket}:${asset.objectKey}`;
+  const expiresBy = asset.embeddingStatus === "done" ? undefined : new Date(Math.max(
+    asset.storedAt ? new Date(asset.storedAt).getTime() + 3_600_000 : 0,
+    asset.retainedUntil ? new Date(asset.retainedUntil).getTime() : 0,
+  ));
+  const cacheKey = `${asset.bucket}:${asset.objectKey}:${expiresBy?.getTime() ?? ""}`;
   let url = signed.get(cacheKey);
   if (!url) {
-    url = storage.signGet(asset.objectKey);
+    url = storage.signGet(asset.objectKey, expiresBy);
     signed.set(cacheKey, url);
   }
   try {
